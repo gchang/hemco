@@ -168,7 +168,7 @@ MODULE HCOX_ParaNOx_MOD
      REAL(sp), POINTER     :: DNOX_LUT18   (:,:,:,:,:,:,:)
 
      ! Location and type of look up table data
-     CHARACTER(LEN=255)    :: LutDir
+     CHARACTER(LEN=1023)   :: LutDir
      LOGICAL               :: IsNc
 
      TYPE(MyInst), POINTER :: NextInst => NULL()
@@ -1511,7 +1511,7 @@ CONTAINS
 !
 ! !LOCAL VARIABLES:
    INTEGER             :: IOS
-   CHARACTER(LEN=255)  :: FILENAME
+   CHARACTER(LEN=1023) :: FILENAME
    CHARACTER(LEN=255)  :: MSG
    INTEGER             :: fID
 
@@ -1668,7 +1668,7 @@ CONTAINS
    INTEGER             :: st1d(1), ct1d(1)
    INTEGER             :: st7d(7), ct7d(7)
 
-   CHARACTER(LEN=255)  :: MSG,     FileMsg
+   CHARACTER(LEN=1023) :: MSG,     FileMsg
 
    !=================================================================
    ! In dry-run mode, print file path to dryrun log and exit.
@@ -1853,7 +1853,7 @@ CONTAINS
 !
 ! !LOCAL VARIABLES:
    INTEGER             :: IOS
-   CHARACTER(LEN=255)  :: FILENAME
+   CHARACTER(LEN=1023) :: FILENAME
    CHARACTER(LEN=255)  :: MSG, LOC
    INTEGER             :: fID
 
@@ -1975,7 +1975,7 @@ CONTAINS
 !   INTEGER             :: I, I1, I2, I3, I4, I5, I6, I7
 !   REAL*4, POINTER     :: TMPARR(:,:,:,:,:,:,:) => NULL()
 
-   CHARACTER(LEN=255)  :: MSG, FileMsg
+   CHARACTER(LEN=1023) :: MSG, FileMsg
 !
 ! !DEFINED PARAMETERS:
 !

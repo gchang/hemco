@@ -104,8 +104,8 @@ MODULE HCOX_Volcano_Mod
    INTEGER,  ALLOCATABLE           :: VolcJdx(:)       ! Lat grid index
    INTEGER,  ALLOCATABLE           :: VolcBeg(:)       ! Begin time (optional)
    INTEGER,  ALLOCATABLE           :: VolcEnd(:)       ! End time   (optional)
-   CHARACTER(LEN=255)              :: FileName         ! Volcano file name
-   CHARACTER(LEN=255)              :: ClimFile         ! Climatology file name
+   CHARACTER(LEN=1023)             :: FileName         ! Volcano file name
+   CHARACTER(LEN=1023)             :: ClimFile         ! Climatology file name
    CHARACTER(LEN=255)              :: VolcSource       ! Volcano data source
    INTEGER                         :: YmdOnFile = -1   ! Date of file currently in record 
    CHARACTER(LEN=61), ALLOCATABLE  :: SpcScalFldNme(:) ! Names of scale factor fields
@@ -579,8 +579,8 @@ CONTAINS
     REAL(hp), ALLOCATABLE :: VolcLon(:)      ! Volcano longitude [deg E]
     REAL(hp), ALLOCATABLE :: VolcLat(:)      ! Volcano latitude  [deg N]
     LOGICAL               :: FileExists, EOF
-    CHARACTER(LEN=255)    :: ThisFile, ThisLine
-    CHARACTER(LEN=255)    :: MSG,      FileMsg
+    CHARACTER(LEN=1023)   :: ThisFile, MSG, FileMsg
+    CHARACTER(LEN=255)    :: ThisLine
     CHARACTER(LEN=255)    :: LOC = 'ReadVolcTable (hcox_volcano_mod.F90)'
 
     !=================================================================

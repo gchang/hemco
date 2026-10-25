@@ -802,7 +802,8 @@ CONTAINS
     LOGICAL                        :: FOUND, FileExists
     INTEGER, ALLOCATABLE           :: HcoIDs(:)
     CHARACTER(LEN=31), ALLOCATABLE :: SpcNames(:)
-    CHARACTER(LEN=255)             :: MSG, LOC, FILENAME, FileMsg
+    CHARACTER(LEN=255)             :: LOC
+    CHARACTER(LEN=1023)            :: MSG, FILENAME, FileMsg
     TYPE(MyInst), POINTER          :: Inst
 
     !=======================================================================
