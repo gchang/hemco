@@ -1,0 +1,3312 @@
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !MODULE: hco_calc_mod.F90
+!
+! !DESCRIPTION: Module HCO\_Calc\_Mod contains routines to calculate
+! HEMCO core emissions based on the content of the HEMCO EmisList
+! object. All emissions are in [kg/m2/s].
+!\\
+!\\
+! Emissions for the current datetime are calculated by multiplying base
+! emissions fields with the associated scale factors. Different
+! inventories are merged/overlayed based upon the category and hierarchy
+! attributes assigned to the individual base fields. Within the same
+! category, fields of higher hierarchy overwrite lower-hierarchy fields.
+! Emissions of different categories are always added.
+!\\
+!\\
+! The assembled emission array is written into the corresponding emission
+! rates array of the HEMCO state object: HcoState%Spc(HcoID)%Emis, where
+! HcoID denotes the corresponding species ID. Emis covers dimension lon,
+! lat, lev on the HEMCO grid, i.e. unlike the emission arrays in EmisList
+! that only cover the levels defined in the source files, Emis extends
+! over all vertical model levels.
+!\\
+!\\
+! Negative emissions are not supported and are ignored. Surface
+! deposition velocities are stored in HcoState%Spc(HcoID)%Depv and can
+! be added therein.
+!\\
+!\\
+! In addition to emissions and surface deposition rates, HEMCO also
+! supports concentrations (kg/m3). Data is automatically written into
+! the concentration array HcoState%Spc(HcoID)%Conc if the source data
+! is marked as being concentration data (i.e. if Dta%IsConc is .TRUE.).
+! The latter is automatically determined by HEMCO based upon the data
+! units.
+!\\
+!\\
+! All emission calculation settings are passed through the HcoState
+! options object (HcoState%Options). These include:
+!
+! \begin{itemize}
+!  \item ExtNr: extension number to be considered.
+!  \item SpcMin: lower species ID (HEMCO ID) to be considered.
+!  \item SpcMax: upper species ID (HEMCO ID) to be considered. If set
+!        to -1, all species above or equal to SpcMin are considered.
+!  \item CatMin: lower emission category to be considered.
+!  \item CatMax: upper emission category to be considered. If set to
+!        -1, all categories above or equal to CatMin are considered.
+!  \item FillBuffer: if set to TRUE, the emissions will be written into
+!        buffer array HcoState%Buffer3D instead of HcoState%Spc(ID)%Emis.
+!        If this option is enabled, only one species can be calculated at
+!        a time (by setting SpcMin/SpcMax, CatMin/CatMax and/or ExtNr
+!        accordingly). This option is useful for extensions, e.g. if
+!        additional scalings need to be done on some emission fields
+!        assembled by HEMCO (e.g. PARANOX extension).
+! \end{itemize}
+!
+! !INTERFACE:
+!
+MODULE HCO_Calc_Mod
+!
+! !USES:
+!
+  USE HCO_Diagn_Mod
+  USE HCO_Error_Mod
+  USE HCO_Types_Mod
+  USE HCO_DataCont_Mod, ONLY : Pnt2DataCont
+
+  IMPLICIT NONE
+  PRIVATE
+!
+! !PUBLIC MEMBER FUNCTIONS:
+!
+  PUBLIC  :: HCO_CalcEmis
+  PUBLIC  :: HCO_CheckDepv
+  PUBLIC  :: HCO_EvalFld
+  PUBLIC  :: HCO_MaskFld
+#ifdef ADJOINT
+  PUBLIC  :: GET_CURRENT_EMISSIONS_ADJ
+#endif
+!
+! !PRIVATE MEMBER FUNCTIONS:
+!
+  PRIVATE :: GET_CURRENT_EMISSIONS
+  PRIVATE :: GetMaskVal
+  PRIVATE :: GetDilFact
+  PRIVATE :: GetVertIndx
+  PRIVATE :: GetIdx
+!
+! !PARAMETER
+!
+  ! Mask threshold. All mask values below this value will be evaluated
+  ! as zero (= outside of mask), and all values including and above this
+  ! value as inside the mask. This is only of relevance if the MaskFractions
+  ! option is false. If MaskFractions is true, the fractional mask values are
+  ! considered, e.g. a grid box can contribute 40% to a mask region, etc.
+  ! The MaskFractions toggle can be set in the settings section of the HEMCO
+  ! configuration file (Use mask fractions: true/false). It defaults to false.
+  REAL(sp), PARAMETER  :: MASK_THRESHOLD = 0.5_sp
+!
+! ============================================================================
+!
+! !REVISION HISTORY:
+!  25 Aug 2012 - C. Keller   - Initial version.
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+  INTERFACE HCO_EvalFld
+     MODULE PROCEDURE HCO_EvalFld_2D
+     MODULE PROCEDURE HCO_EvalFld_3D
+  END INTERFACE HCO_EvalFld
+
+CONTAINS
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: HCO_CalcEmis
+!
+! !DESCRIPTION: Subroutine HCO\_CalcEmis calculates the 3D emission
+! fields at current datetime for the specified species, categories, and
+! extension number.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE HCO_CalcEmis( HcoState, UseConc, RC )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+    USE HCO_ARR_MOD,      ONLY : HCO_ArrAssert
+    USE HCO_DATACONT_MOD, ONLY : ListCont_NextCont
+    USE HCO_FILEDATA_MOD, ONLY : FileData_ArrIsDefined
+    USE HCO_Scale_Mod,    ONLY : HCO_ScaleArr
+!
+! !INPUT PARAMETERS:
+!
+    LOGICAL,         INTENT(IN   )  :: UseConc    ! Use concentration fields?
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER        :: HcoState   ! HEMCO state object
+    INTEGER,         INTENT(INOUT)  :: RC         ! Return code
+!
+! !REVISION HISTORY:
+!  25 Aug 2012 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Working pointers: list and data container
+    TYPE(ListCont), POINTER :: Lct
+    TYPE(DataCont), POINTER :: Dct
+
+    ! Temporary emission arrays
+    REAL(hp), POINTER       :: OutArr(:,:,:) => NULL()
+    REAL(hp), TARGET        :: SpcFlx( HcoState%NX, &
+                                       HcoState%NY, &
+                                       HcoState%NZ   )
+    REAL(hp), TARGET        :: CatFlx( HcoState%NX, &
+                                       HcoState%NY, &
+                                       HcoState%NZ   )
+    REAL(hp), TARGET        :: TmpFlx( HcoState%NX, &
+                                       HcoState%NY, &
+                                       HcoState%NZ   )
+    REAL(hp)                :: Mask  ( HcoState%NX, &
+                                       HcoState%NY, &
+                                       HcoState%NZ   )
+    REAL(hp)                :: HirFlx( HcoState%NX, &
+                                       HcoState%NY, &
+                                       HcoState%NZ   )
+    REAL(hp)                :: HirMsk( HcoState%NX, &
+                                       HcoState%NY, &
+                                       HcoState%NZ   )
+
+    ! Integers
+    INTEGER             :: ThisSpc, PrevSpc ! current and previous species ID
+    INTEGER             :: ThisCat, PrevCat ! current and previous category
+    INTEGER             :: ThisHir, PrevHir ! current and previous hierarchy
+    INTEGER             :: SpcMin,  SpcMax  ! range of species to be considered
+    INTEGER             :: CatMin,  CatMax  ! range of categories to be considered
+    INTEGER             :: ExtNr            ! Extension Nr to be used
+    INTEGER             :: nI, nJ, nL
+    INTEGER             :: nnSpec, FLAG
+
+    LOGICAL             :: Found, DoDiagn, EOL, UpdateCat
+
+    ! For error handling & verbose mode
+    CHARACTER(LEN=255)  :: MSG, LOC
+
+    ! testing / debugging
+    integer :: ix,iy,L
+
+    !=================================================================
+    ! HCO_CalcEmis begins here!
+    !=================================================================
+
+    ! testing only
+    ix = 30
+    iy = 34
+
+    ! Initialize
+    LOC = 'HCO_CalcEmis (HCO_CALC_MOD.F90)'
+    Lct => NULL()
+    Dct => NULL()
+
+    ! Enter routine
+    CALL HCO_ENTER (HcoState%Config%Err, LOC, RC )
+    IF(RC /= HCO_SUCCESS) RETURN
+
+    !-----------------------------------------------------------------
+    ! Initialize variables
+    !-----------------------------------------------------------------
+
+    ! Initialize
+    SpcFlx(:,:,:)    = 0.0_hp
+    CatFlx(:,:,:)    = 0.0_hp
+    HirFlx(:,:,:)    = 0.0_hp
+    HirMsk(:,:,:)    = 0.0_hp
+    PrevSpc          = -1
+    PrevHir          = -1
+    PrevCat          = -1
+    nnSpec           = 0
+
+    ! Pass emission grid dimensions
+    nI = HcoState%NX
+    nJ = HcoState%NY
+    nL = HcoState%NZ
+
+    ! Pass calculation options
+    SpcMin  = HcoState%Options%SpcMin        !Lower species ID
+    SpcMax  = HcoState%Options%SpcMax        !Upper species ID
+    CatMin  = HcoState%Options%CatMin        !Lower emission category
+    CatMax  = HcoState%Options%CatMax        !Upper emission category
+    ExtNr   = HcoState%Options%ExtNr         !Extension number
+    DoDiagn = HcoState%Options%AutoFillDiagn !Write AutoFill diagnostics?
+
+    ! Verbose mode
+    IF ( HcoState%Config%doVerbose ) THEN
+       WRITE (MSG, *) 'Run HEMCO calculation w/ following options:'
+       CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+       WRITE (MSG, "(A20,I5)")    'Extension number:', ExtNr
+       CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+       WRITE (MSG, "(A20,I5,I5)") 'Tracer range:', SpcMin, SpcMax
+       CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+       WRITE (MSG, "(A20,I5,I5)") 'Category range:', CatMin, CatMax
+       CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+       WRITE (MSG, *) 'Auto diagnostics: ', DoDiagn
+       CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+    ENDIF
+
+    !=================================================================
+    ! Walk through all containers of EmisList and determine the
+    ! emissions for all containers that qualify for calculation.
+    ! The containers in EmisList are sorted by species, category and
+    ! hierarchy. This enables a straightforward, piece-by-piece
+    ! assembly of the final emission array (start with lowest
+    ! hierarchy emissions, then overwrite piece-by-piece with higher
+    ! hierarchy values).
+    !=================================================================
+
+    ! Point to the head of the emissions linked list
+    EOL = .FALSE. ! End of list
+    Lct => NULL()
+    CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+
+    ! Do until end of EmisList (==> loop over all emission containers)
+    DO
+       ! Have we reached the end of the list?
+       EOL = .FALSE.
+       IF ( FLAG /= HCO_SUCCESS ) EOL = .TRUE.
+
+       ! ------------------------------------------------------------
+       ! Select container and update all working variables & arrays.
+       ! ------------------------------------------------------------
+       IF ( .NOT. EOL ) THEN
+
+          ! Dct is the current data container
+          Dct => Lct%Dct
+
+          ! Check if this is a base field
+          IF ( Dct%DctType /= HCO_DCTTYPE_BASE ) THEN
+             CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+             CYCLE
+          ENDIF
+
+          ! Sanity check: Make sure this container holds data.
+          ! 'Empty' containers are possible if the simulation time
+          ! is outside of the specified data time range and time
+          ! slice cycling is deactivated (CycleFlag > 1).
+          IF( .NOT. FileData_ArrIsDefined(Lct%Dct%Dta) ) THEN
+             CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+             CYCLE
+          ENDIF
+
+          ! Check if this is the specified extension number
+          IF ( Dct%ExtNr /= ExtNr ) THEN
+             CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+             CYCLE
+          ENDIF
+
+          ! Advance to next container if the species ID is outside
+          ! the specified species range (SpcMin - SpcMax). Consider
+          ! all species above SpcMin if SpcMax is negative!
+          IF( (  Dct%HcoID < SpcMin                     ) .OR. &
+              ( (Dct%HcoID > SpcMax) .AND. (SpcMax > 0) ) ) THEN
+             CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+             CYCLE
+          ENDIF
+
+          ! Advance to next emission field if the emission category of
+          ! the current container is outside of the specified species
+          ! range (CatMin - CatMax). Consider all categories above CatMin
+          ! if CatMax is negative!
+          IF( (  Dct%Cat < CatMin                     ) .OR. &
+              ( (Dct%Cat > CatMax) .AND. (CatMax > 0) ) ) THEN
+             CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+             CYCLE
+          ENDIF
+
+          ! Check if this container holds data in the desired unit format,
+          ! i.e. concentration data if UseConc is enabled, emission data
+          ! otherwise.
+          IF ( UseConc .NEQV. Dct%Dta%IsConc ) THEN
+             CALL ListCont_NextCont ( HcoState%EmisList, Lct, FLAG )
+             CYCLE
+          ENDIF
+
+          ! Update working variables
+          ThisSpc = Dct%HcoID
+          ThisCat = Dct%Cat
+          ThisHir = Dct%Hier
+
+       ! If end of list, use dummy values for ThisSpc, ThisCat and ThisHir
+       ! to make sure that emissions are added to HEMCO in the section
+       ! below!
+       ELSE
+          ThisSpc = -1
+          ThisCat = -1
+          ThisHir = -1
+       ENDIF
+
+       !--------------------------------------------------------------------
+       ! Before computing emissions of current data container make sure that
+       ! emissions of previous container are properly archived.
+       !--------------------------------------------------------------------
+
+       ! Add emissions on hierarchy level to the category flux array. Do
+       ! this only if this is a new species, a new category or a new
+       ! hierarchy level.
+       ! Note: no need to add to diagnostics because hierarchy level
+       ! diagnostics are filled right after computing the emissions of
+       ! a given data container (towards the end of the DO loop).
+       IF ( (ThisHir /= PrevHir) .OR. &
+            (ThisSpc /= PrevSpc) .OR. &
+            (ThisCat /= PrevCat)        ) THEN
+
+          ! Add hierarchy level emissions to category array over the
+          ! covered regions.
+          CatFlx = ( (1.0_hp - HirMsk) * CatFlx ) + HirFlx
+
+          ! Reset
+          HirFlx = 0.0_hp
+          HirMsk = 0.0_hp
+       ENDIF
+
+       !--------------------------------------------------------------------
+       ! If this is a new species or category, pass the previously collected
+       ! emissions to the species array. Update diagnostics at category level.
+       ! Skip this step for first species, i.e. if PrevSpc is still -1.
+       !--------------------------------------------------------------------
+       UpdateCat = .FALSE.
+       IF ( ThisCat /= PrevCat ) UpdateCat = .TRUE.
+       IF ( ThisSpc /= PrevSpc ) UpdateCat = .TRUE.
+       IF ( PrevCat <= 0 .OR. PrevSpc <= 0 ) UpdateCat = .FALSE.
+       IF ( UpdateCat ) THEN
+
+          ! CatFlx holds the emissions for this category. Pass this to
+          ! the species array SpcFlx.
+          SpcFlx(:,:,:) = SpcFlx(:,:,:) + CatFlx(:,:,:)
+
+          ! verbose
+          IF ( HcoState%Config%doVerbose ) THEN
+             WRITE(MSG,*) 'Added category emissions to species array: '
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'Species       : ', PrevSpc
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'Category      : ', PrevCat
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'Cat. emissions: ', SUM(CatFlx)
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'Spc. emissions: ', SUM(SpcFlx)
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+
+             ! Optional debug print: single column profile of emissions
+             !DO L = 1, HcoState%NZ
+             !   CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             !   WRITE(MSG,*) 'Cat. emissions at (1,1,L): ', L, CatFlx(1,1,L)
+             !ENDDO
+
+          ENDIF
+
+          ! Add category emissions to diagnostics at category level
+          ! (only if defined in the diagnostics list).
+          IF ( Diagn_AutoFillLevelDefined(HcoState%Diagn,3) .AND. DoDiagn ) THEN
+             ! Bug fix: Make sure to pass COL=-1 to ensure all HEMCO diagnostics
+             ! are updated, including those manually defined in other models
+             ! (mps, 11/30/21)
+             CALL Diagn_Update( HcoState,    ExtNr=ExtNr,   &
+                                Cat=PrevCat, Hier=-1,  HcoID=PrevSpc, &
+                                AutoFill=1,  Array3D=CatFlx, COL=-1, RC=RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                 CALL HCO_ERROR( 'ERROR 0', RC, THISLOC=LOC )
+                 RETURN
+             ENDIF
+#ifdef ADJOINT
+             IF (HcoState%IsAdjoint) THEN
+                CALL Diagn_Update( HcoState,    ExtNr=ExtNr,             &
+                                   Cat=PrevCat, Hier=-1,  HcoID=PrevSpc, &
+                                   AutoFill=1,  Array3D=CatFlx,          &
+                                   COL=HcoState%Diagn%HcoDiagnIDAdjoint, RC=RC )
+                IF ( RC /= HCO_SUCCESS ) THEN
+                    CALL HCO_ERROR( 'ERROR 1', RC, THISLOC=LOC )
+                    RETURN
+                ENDIF
+             ENDIF
+#endif
+          ENDIF
+
+          ! Reset CatFlx array and the previously used hierarchy
+          ! ==> Emission hierarchies are only important within the
+          ! same category, hence always start over at lowest hierarchy
+          ! when entering a new category.
+          CatFlx(:,:,:)  = 0.0_hp
+          PrevHir        = -1
+       ENDIF
+
+       !--------------------------------------------------------------------
+       ! If this is a new species, pass previously calculated emissions
+       ! to the final emissions array in HcoState.
+       ! Update diagnostics at extension number level.
+       ! Don't do before first emission calculation, i.e. if PrevSpc
+       ! is still the initialized value of -1!
+       !--------------------------------------------------------------------
+       IF ( ThisSpc /= PrevSpc .AND. PrevSpc > 0 ) THEN
+
+          ! Add to OutArr
+          OutArr(:,:,:) = OutArr(:,:,:) + SpcFlx(:,:,:)
+
+          ! testing only
+          IF ( HcoState%Config%doVerbose ) THEN
+             WRITE(MSG,*) 'Added total emissions to output array: '
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'Species: ', PrevSpc
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'SpcFlx : ', SUM(SpcFlx)
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'OutArr : ', SUM(OutArr)
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          ENDIF
+
+          ! Add to diagnostics at extension number level.
+          ! The same diagnostics may be updated multiple times during
+          ! the same time step, continuously adding emissions to it.
+          IF ( Diagn_AutoFillLevelDefined(HcoState%Diagn,2) .AND. DoDiagn ) THEN
+             ! Bug fix: Make sure to pass COL=-1 to ensure all HEMCO diagnostics
+             ! are updated, including those manually defined in other models
+             ! (mps, 11/30/21)
+             CALL Diagn_Update( HcoState,  ExtNr=ExtNr,  &
+                                Cat=-1,    Hier=-1,  HcoID=PrevSpc, &
+                               AutoFill=1,Array3D=SpcFlx, COL=-1, RC=RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                 CALL HCO_ERROR( 'ERROR 2', RC, THISLOC=LOC )
+                 RETURN
+             ENDIF
+#ifdef ADJOINT
+             IF (HcoState%IsAdjoint) THEN
+                CALL Diagn_Update( HcoState,  ExtNr=ExtNr,             &
+                                   Cat=-1,    Hier=-1,  HcoID=PrevSpc, &
+                                   AutoFill=1,Array3D=SpcFlx,          &
+                                   COL=HcoState%Diagn%HcoDiagnIDAdjoint, RC=RC )
+                IF ( RC /= HCO_SUCCESS ) THEN
+                    CALL HCO_ERROR( 'ERROR 3', RC, THISLOC=LOC )
+                    RETURN
+                ENDIF
+             ENDIF
+#endif
+          ENDIF
+
+          ! Reset arrays and previous hierarchy.
+          SpcFlx(:,:,:)  =  0.0_hp
+          PrevCat        =  -1
+          PrevHir        =  -1
+          OutArr         => NULL()
+       ENDIF
+
+       !--------------------------------------------------------------------
+       ! Exit DO loop here if end of list
+       !--------------------------------------------------------------------
+       IF ( EOL ) EXIT
+
+       !--------------------------------------------------------------------
+       ! Update/archive information on species level if needed
+       !--------------------------------------------------------------------
+       IF ( ThisSpc /= PrevSpc .AND. ThisSpc > 0 ) THEN
+
+          ! Update number of species for which emissions have been
+          ! calculated.
+          nnSpec = nnSpec + 1
+
+          ! To write emissions into temporary array, make OutArr point
+          ! to the buffer array HcoState%Buffer3D.
+          IF ( HcoState%Options%FillBuffer ) THEN
+
+             ! Cannot use temporary array for more than one species!
+             IF ( nnSpec > 1 ) THEN
+                MSG = 'Cannot fill buffer for more than one species!'
+                CALL HCO_ERROR( MSG, RC )
+                RETURN
+             ENDIF
+
+             ! Point to array and check allocation status as well as
+             ! array size.
+             OutArr => HcoState%Buffer3D%Val
+             IF ( .NOT. ASSOCIATED( OutArr ) ) THEN
+                MSG = 'Buffer array is not associated'
+                CALL HCO_ERROR( MSG, RC )
+                RETURN
+             ENDIF
+             IF ( (SIZE(OutArr,1) /= nI) .OR. &
+                  (SIZE(OutArr,2) /= nJ) .OR. &
+                  (SIZE(OutArr,3) /= nL)       ) THEN
+                MSG = 'Buffer array has wrong dimension!'
+                CALL HCO_ERROR( MSG, RC )
+                RETURN
+             ENDIF
+
+          ! To write emissions directly into HcoState, make OutArr
+          ! point to current species' array in HcoState. Use emission
+          ! array for emissions, and concentration array for concentrations.
+          ELSE
+
+             ! For concentrations:
+             IF ( UseConc ) THEN
+                CALL HCO_ArrAssert( HcoState%Spc(ThisSpc)%Conc, &
+                                    nI, nJ, nL, RC             )
+                IF ( RC /= HCO_SUCCESS ) THEN
+                    CALL HCO_ERROR( 'ERROR 4', RC, THISLOC=LOC )
+                    RETURN
+                ENDIF
+                OutArr => HcoState%Spc(ThisSpc)%Conc%Val
+
+             ! For emissions:
+             ELSE
+                CALL HCO_ArrAssert( HcoState%Spc(ThisSpc)%Emis, &
+                                    nI, nJ, nL, RC             )
+                IF ( RC /= HCO_SUCCESS ) THEN
+                    CALL HCO_ERROR( 'ERROR 5', RC, THISLOC=LOC )
+                    RETURN
+                ENDIF
+                OutArr => HcoState%Spc(ThisSpc)%Emis%Val
+             ENDIF
+
+          ENDIF
+
+          ! verbose mode
+          IF ( HcoState%Config%doVerbose ) THEN
+             WRITE(MSG,*) 'Calculating emissions for species ', &
+                           TRIM(HcoState%Spc(ThisSpc)%SpcName)
+             CALL HCO_MSG( MSG, SEP1='-', SEP2='-', LUN=HcoState%Config%hcoLogLUN )
+          ENDIF
+       ENDIF
+
+       !--------------------------------------------------------------------
+       ! Get current emissions and write into TmpFlx array. The array Mask
+       ! denotes all valid grid boxes for this inventory.
+       !--------------------------------------------------------------------
+       TmpFlx(:,:,:) = 0.0_hp
+       CALL GET_CURRENT_EMISSIONS( HcoState, Dct, nI, nJ, nL, TmpFlx, Mask, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+           CALL HCO_ERROR( 'ERROR 6', RC, THISLOC=LOC )
+           RETURN
+       ENDIF
+
+       ! Eventually add universal scale factor
+       CALL HCO_ScaleArr( HcoState, ThisSpc, TmpFlx, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+           CALL HCO_ERROR( 'ERROR 7', RC, THISLOC=LOC )
+           RETURN
+       ENDIF
+
+       ! Check for negative values according to the corresponding setting
+       ! in the configuration file: 2 means allow negative values, 1 means
+       ! set to zero and prompt a warning, else return with error.
+       IF ( HcoState%Options%NegFlag /= 2 ) THEN
+
+          IF ( ANY(TmpFlx < 0.0_hp) ) THEN
+
+             ! Set to zero and prompt warning
+             IF ( HcoState%Options%NegFlag == 1 ) THEN
+                WHERE ( TmpFlx < 0.0_hp ) TmpFlx = 0.0_hp
+                MSG = 'Negative emissions set to zero: '// TRIM(Dct%cName)
+                IF ( HcoState%Config%doVerbose ) CALL HCO_WARNING( MSG )
+
+             ! Return with error
+             ELSE
+                MSG = 'Negative emissions in: '// TRIM(Dct%cName) // '. ' // &
+                'To allow negatives, edit settings in the configuration file.'
+                CALL HCO_ERROR( MSG, RC )
+                RETURN
+             ENDIF
+          ENDIF
+       ENDIF
+
+       ! ------------------------------------------------------------
+       ! Collect all emissions of the same category (and species) on
+       ! the hierarchy level into array HirFlx. HirMsk contains the
+       ! combined covered region. That is, if there are two regional
+       ! inventories with the same hierarchy HirMsk will cover both
+       ! of these regions.
+       ! The specified field hierarchies determine whether the
+       ! temporary emissions are added (if hierarchy is the same
+       ! as the previously used hierarchy), or if they overwrite the
+       ! previous values in HirFlx (if hierarchy is higher than the
+       ! previous hierarchy).
+       ! ------------------------------------------------------------
+
+       ! Add emissions to the hierarchy array HirFlx if this hierarchy
+       ! is the same as previous hierarchy
+       IF ( ThisHir == PrevHir ) THEN
+          HirFlx = HirFlx + TmpFlx
+          HirMsk = HirMsk + Mask
+
+          ! Make sure mask values do not exceed 1.0
+          WHERE(HirMsk > 1.0 ) HirMsk = 1.0
+
+       ! If hierarchy is larger than those of the previously used
+       ! fields, overwrite HirFlx with new values.
+       ELSE
+
+          HirFlx = TmpFlx
+          HirMsk = Mask
+
+       ENDIF
+
+       ! Update diagnostics at hierarchy level. Make sure that only
+       ! positive values are used.
+       ! The same diagnostics may be updated multiple times
+       ! during the same time step, continuously adding
+       ! emissions to it.
+       ! Now remove PosOnly flag. TmpFlx is initialized to zero, so it's
+       ! ok to keep negative values (ckeller, 7/12/15).
+       IF ( Diagn_AutoFillLevelDefined(HcoState%Diagn,4) .AND. DoDiagn ) THEN
+             ! Bug fix: Make sure to pass COL=-1 to ensure all HEMCO diagnostics
+             ! are updated, including those manually defined in other models
+             ! (mps, 11/30/21)
+          CALL Diagn_Update( HcoState,       ExtNr=ExtNr,   &
+                             Cat=ThisCat,Hier=ThisHir,   HcoID=ThisSpc, &
+                             AutoFill=1, Array3D=TmpFlx, &
+                             COL=-1, RC=RC )
+          IF ( RC /= HCO_SUCCESS ) THEN
+              CALL HCO_ERROR( 'ERROR 8', RC, THISLOC=LOC )
+              RETURN
+          ENDIF
+#ifdef ADJOINT
+          IF (HcoState%IsAdjoint) THEN
+             ! I don't know why I chose collection=-1 instead of
+             ! collection=HcoState%Diagn%HcoDiagnIDAdjoint like in the other
+             ! parts of the adjoint code here, but it's what worked in the
+             ! old repo so I'm keeping it for now. May need to change
+             CALL Diagn_Update( HcoState,       ExtNr=ExtNr,               &
+                                Cat=ThisCat,Hier=ThisHir,   HcoID=ThisSpc, &
+                                AutoFill=1, Array3D=TmpFlx,                &
+                                COL=-1, RC=RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                 CALL HCO_ERROR( 'ERROR 9', RC, THISLOC=LOC )
+                 RETURN
+             ENDIF
+          ENDIF
+
+#endif
+       ENDIF
+
+       ! Update previously used species, category and hierarchy
+       PrevSpc = ThisSpc
+       PrevCat = ThisCat
+       PrevHir = ThisHir
+
+       ! Advance to next emission container
+       CALL ListCont_NextCont( HcoState%EmisList, Lct, FLAG )
+
+    ENDDO ! Loop over EmisList
+
+    ! Make sure internal pointers are nullified
+    Lct    => NULL()
+    Dct    => NULL()
+    OutArr => NULL()
+
+    ! verbose
+    IF ( HcoState%Config%doVerbose ) THEN
+       WRITE (MSG, *) 'HEMCO emissions successfully calculated!'
+       CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+    ENDIF
+
+    ! Leave w/ success
+    CALL HCO_LEAVE ( HcoState%Config%Err, RC )
+
+  END SUBROUTINE HCO_CalcEmis
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: HCO_CheckDepv
+!
+! !DESCRIPTION: Subroutine HCO\_CheckDepv is a simple routine to check the
+! dry deposition frequency value. This is to avoid unrealistically high
+! deposition frequencies that may occur if grid box concentrations are very
+! low. The deposition frequency is limited to a value that will make sure
+! that the drydep exponent ( exp( -depfreq * dt ) ) is still small enough to
+! remove all species mass. The maximum limit of depfreq * dt can be defined
+! as a HEMCO option (MaxDepExp). Its default value is 20.0.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE HCO_CheckDepv( HcoState, Depv, RC )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER        :: HcoState   ! HEMCO state object
+    REAL(hp),        INTENT(INOUT)  :: Depv       ! Deposition velocity
+    INTEGER,         INTENT(INOUT)  :: RC         ! Return code
+!
+! !REVISION HISTORY:
+!  11 Mar 2015 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    REAL(hp)  :: ExpVal
+
+    !=================================================================
+    ! HCO_CheckDepv begins here!
+    !=================================================================
+
+    ExpVal = Depv * HcoState%TS_EMIS
+    IF ( ExpVal > HcoState%Options%MaxDepExp ) THEN
+       Depv = HcoState%Options%MaxDepExp / HcoState%TS_EMIS
+    ENDIF
+
+  END SUBROUTINE HCO_CheckDepv
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Get_Current_Emissions
+!
+! !DESCRIPTION: Subroutine Get\_Current\_Emissions calculates the current
+!  emissions for the specified emission container.
+!  This subroutine is only called by HCO\_CalcEmis and for base emission
+!  containers, i.e. containers of type 1.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE Get_Current_Emissions( HcoState, BaseDct,   nI,   nJ,           &
+                                    nL,       OUTARR_3D, MASK, RC, UseLL    )
+!
+! !USES:
+!
+    USE HCO_State_Mod,    ONLY : HCO_State
+    USE HCO_tIdx_MOD,     ONLY : tIDx_GetIndx
+    USE HCO_FileData_Mod, ONLY : FileData_ArrIsDefined
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,           INTENT(IN)  :: nI                  ! # of lons
+    INTEGER,           INTENT(IN)  :: nJ                  ! # of lats
+    INTEGER,           INTENT(IN)  :: nL                  ! # of levs
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+
+    TYPE(HCO_State), POINTER       :: HcoState            ! HEMCO state object
+    TYPE(DataCont),  POINTER       :: BaseDct             ! base emission
+                                                          !  container
+    REAL(hp),        INTENT(INOUT) :: outArr_3D(nI,nJ,nL) ! output array
+    REAL(hp),        INTENT(INOUT) :: mask     (nI,nJ,nL) ! mask array
+    INTEGER,         INTENT(INOUT) :: RC
+!
+! !OUTPUT PARAMETERS:
+!
+    INTEGER,         INTENT(  OUT), OPTIONAL :: UseLL
+!
+! !REMARKS:
+!  This routine uses multiple loops over all grid boxes (base emissions
+!  and scale factors use separate loops). In an OMP environment, this approach
+!  seems to be faster than using only one single loop (but repeated calls to
+!  point to containers, etc.). The alternative approach is used in routine
+!  Get\_Current\_Emissions\_B at the end of this module and may be employed
+!  on request.
+!
+! !REVISION HISTORY:
+!  25 Aug 2012 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Pointers
+    TYPE(DataCont), POINTER :: ScalDct
+    TYPE(DataCont), POINTER :: MaskDct
+    TYPE(DataCont), POINTER :: LevDct1
+    TYPE(DataCont), POINTER :: LevDct2
+
+    ! Scalars
+    REAL(sp)                :: tmpVal, MaskScale
+    REAL(hp)                :: outData
+    REAL(hp)                :: ScalFact
+    INTEGER                 :: tIDx,  IDX
+    INTEGER                 :: totLL, nnLL
+    INTEGER                 :: I,     J,     L,      N
+    INTEGER                 :: LowLL, UppLL, ScalLL, TmpLL
+    INTEGER                 :: EC,    ERROR
+    CHARACTER(LEN=255)      :: MSG,   thisLoc
+    LOGICAL                 :: NegScalExist
+    LOGICAL                 :: MaskFractions
+    LOGICAL                 :: isLevDct1
+    LOGICAL                 :: isLevDct2
+    LOGICAL                 :: isMaskDct
+    LOGICAL                 :: isPblHt
+    LOGICAL                 :: isBoxHt
+    INTEGER                 :: LevDct1_Unit
+    INTEGER                 :: LevDct2_Unit
+
+    ! testing only
+    INTEGER, PARAMETER      :: IX=25, IY=25
+
+    !=================================================================
+    ! GET_CURRENT_EMISSIONS begins here
+    !=================================================================
+
+    ! Initialize
+    ScalDct => NULL()
+    MaskDct => NULL()
+    msg     = ''
+    thisLoc = 'GET_CURRENT_EMISSIONS (hco_calc_mod.F90)'
+
+    ! Enter
+    CALL HCO_Enter( HcoState%Config%Err, thisLoc, RC )
+    IF ( RC /= HCO_SUCCESS ) RETURN
+
+    ! Check if container contains data
+    IF ( .NOT. FileData_ArrIsDefined(BaseDct%Dta) ) THEN
+       msg = 'Array not defined: ' // TRIM(BaseDct%cName)
+       CALL HCO_Error( msg, RC, thisLoc )
+       RETURN
+    ENDIF
+
+    ! Initialize mask. By default, assume that we use all grid boxes.
+    MASK          = 1.0_hp
+    MaskFractions = HcoState%Options%MaskFractions
+
+    ! Verbose output
+    IF ( HcoState%Config%doVerbose ) THEN
+       WRITE(msg,*) 'Evaluate field ', TRIM(BaseDct%cName)
+       CALL HCO_Msg( msg, sep1=' ', LUN=HcoState%Config%hcoLogLUN )
+    ENDIF
+
+#ifndef MAPL_ESMF
+    ! Put check for PBLHEIGHT here, if not running in ESMF/MAPL
+    IF ( .NOT. ASSOCIATED( HcoState%Grid%PBLHEIGHT%Val ) ) THEN
+       msg = 'PBLHEIGHT (in meters) is missing in HEMCO state'
+       CALL HCO_Error( msg, RC, thisLoc )
+       RETURN
+    ENDIF
+#endif
+
+    !========================================================================
+    ! Set base emissions
+    !========================================================================
+
+    ! Check for level index containers
+    ! Move error checks here, outside of the parallel DO loop
+    ! Remove ELSE blocks for efficiency
+    LevDct1 => NULL()
+    IF ( BaseDct%levScalID1 > 0 ) THEN
+       CALL Pnt2DataCont( HcoState, BaseDct%levScalID1, LevDct1, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+          msg = 'Could not get a pointer to LevDct1 from HcoState!'
+          CALL HCO_Error( msg, RC, thisLoc )
+          RETURN
+       ENDIF
+    ENDIF
+
+    LevDct2 => NULL()
+    IF ( BaseDct%levScalID2 > 0 ) THEN
+       CALL Pnt2DataCont( HcoState, BaseDct%levScalID2, LevDct2, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+          msg = 'Could not get a pointer to LevDct2 in HcoState!'
+          CALL HCO_Error( msg, RC, thisLoc )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Test whether LevDct1 and LevDct2 are associated
+    isLevDct1 = ASSOCIATED( LevDct1 )
+    isLevDct2 = ASSOCIATED( LevDct2 )
+
+    ! Get the units of LevDct1 (if it exists)
+    LevDct1_Unit = -1
+    IF ( isLevDct1 ) THEN
+       LevDct1_Unit = GetEmisLUnit( HcoState, LevDct1 )
+       IF ( LevDct1_Unit < 0 ) THEN
+          MSG = 'LevDct1 units are not defined!'
+          CALL HCO_Error( msg, RC, thisLoc )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Get the units of LevDct2 (if it exists)
+    LevDct2_Unit = -1
+    IF ( isLevDct2 ) THEN
+       LevDct2_Unit = GetEmisLUnit( HcoState, LevDct2 )
+       IF ( LevDct2_Unit < 0 ) THEN
+          MSG = 'LevDct2_Units are not defined!'
+          CALL HCO_Error( msg, RC, thisLoc )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Throw an error if boxheight is missing and the units are in meters
+    IF ( LevDct1_Unit == HCO_EMISL_M  .or.                                  &
+         LevDct2_Unit == HCO_EMISL_M ) THEN
+       IF ( .not. ASSOCIATED( HcoState%Grid%BXHEIGHT_M%Val ) ) THEN
+          MSG = 'Boxheight (in meters) is missing in HEMCO state'
+          CALL HCO_Error( msg, RC, thisLoc )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Throw an error if boxheight is missing and the units are in PBL frac
+    IF ( LevDct1_Unit == HCO_EMISL_PBL  .or.                                &
+         LevDct2_Unit == HCO_EMISL_PBL ) THEN
+       IF ( .not. ASSOCIATED( HcoState%Grid%PBLHEIGHT%Val ) ) THEN
+          MSG = 'Boundary layer height is missing in HEMCO state'
+          CALL HCO_Error( msg, RC, thisLoc )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Initialize non-private loop variables here
+    error = 0
+    totLL = 0.0
+    nnLL  = 0.0
+
+    ! Loop over all latitudes and longitudes
+    !$OMP PARALLEL DO                                                        &
+    !$OMP DEFAULT( SHARED                                                   )&
+    !$OMP PRIVATE( I, J, L, tIdx, tmpVal, LowLL, UppLL, EC                  )&
+    !$OMP REDUCTION( +:totLL                                                )&
+    !$OMP REDUCTION( +:nnLL                                                 )&
+    !$OMP COLLAPSE( 2                                                       )&
+    !$OMP SCHEDULE( DYNAMIC, 8                                              )
+    DO J = 1, nJ
+    DO I = 1, nI
+
+       ! Continue to end of loop if an error has occurred
+       ! (we cannot exit from a parallel loop)
+       IF ( error > 0 ) CYCLE
+
+       ! Zero private variables for safety's sake
+       tmpVal  = 0.0_hp
+       lowLL   = 0
+       uppLL   = 0
+       EC      = HCO_SUCCESS
+
+       !---------------------------------------------------------------------
+       ! Get current time index for this container and at this location
+       !---------------------------------------------------------------------
+       tIDx = tIDx_GetIndx( HcoState, BaseDct%Dta, I, J )
+       IF ( tIDx < 1 ) THEN
+          WRITE( msg, * ) 'Cannot get time slice index at location ',I,J,    &
+                          ': ', TRIM(BaseDct%cName), tIDx
+          error = 1
+          CYCLE
+       ENDIF
+
+       !---------------------------------------------------------------------
+       ! Get lower and upper vertical index
+       !---------------------------------------------------------------------
+       CALL GetVertIndx( HcoState,     BaseDct,   isLevDct1, LevDct1,        &
+                         LevDct1_Unit, isLevDct2, LevDct2,   LevDct2_Unit,   &
+                         I,            J,         LowLL,     UppLL,          &
+                         RC=EC                                              )
+
+       ! Trap error
+       IF ( EC /= HCO_SUCCESS ) THEN
+          WRITE(MSG,*) 'Error getting vertical index at location ',I,J,&
+                       ': ', TRIM(BaseDct%cName)
+          error = 1
+          CYCLE
+       ENDIF
+
+       !---------------------------------------------------------------------
+       ! Apply vertical dilution factor (if necessary)
+       !---------------------------------------------------------------------
+
+       ! Update variables for computing the average level
+       totLL = totLL + UppLL
+       nnLL  = nnLL  + 1
+
+       ! Loop over all levels
+       DO L = LowLL, UppLL
+
+          ! Get base value. Use uniform value if scalar field.
+          tmpVal = Get_Value_From_DataCont( I, J, L, tIdx, BaseDct )
+
+          ! If it's a missing value, mask box as unused
+          ! and set value to zero.
+          IF ( tmpVal == HCO_MISSVAL ) THEN
+             mask(I,J,:)      = 0.0_hp
+             outArr_3D(I,J,L) = 0.0_hp
+             CYCLE
+          ENDIF
+
+          ! Otherwise, apply the vertical dilution factor (if necessary)
+          CALL Apply_Dilution_Factor( I        = I,                          &
+                                      J        = J,                          &
+                                      L        = L,                          &
+                                      LowLL    = LowLL,                      &
+                                      UppLL    = UppLL,                      &
+                                      HcoState = HcoState,                   &
+                                      BaseDct  = BaseDct,                    &
+                                      inData   = tmpVal,                     &
+                                      outData  = outArr_3D(I,J,L),           &
+                                      RC       = EC                         )
+
+          ! Trap errors
+          IF ( EC /= HCO_SUCCESS ) THEN
+             error = 1
+             msg   = 'Error encountered in routine "Apply_Dilution_Factor"!'
+             CYCLE
+          ENDIF
+
+       ENDDO !L
+
+    ENDDO !I
+    ENDDO !J
+    !$OMP END PARALLEL DO
+
+    !------------------------------------------------------------------------
+    ! Return if an error occurred in the parallel loop above
+    !------------------------------------------------------------------------
+    IF ( error == 1 ) THEN
+       CALL HCO_Error( msg, RC, thisLoc )
+       RETURN
+    ENDIF
+
+    !========================================================================
+    ! Apply scale factors to base emissions
+    !
+    ! The container IDs of all scale factors associated with this base
+    ! container are stored in vector Scal_cID.
+    !========================================================================
+    IF ( BaseDct%nScalID > 0 ) THEN
+
+       ! Loop over all scale factors for this base emissions
+       DO N = 1, BaseDct%nScalID
+
+          !------------------------------------------------------------------
+          ! Get a pointer to the data container holding this scale factor
+          !------------------------------------------------------------------
+
+          ! Get the Nth scale factor container ID
+          IDX = BaseDct%Scal_cID(N)
+
+          ! Point to data container with the given container ID
+          CALL Pnt2DataCont( HcoState, IDX, ScalDct, RC )
+          IF ( RC /= HCO_SUCCESS ) THEN
+             msg = 'Could not get scale factor for base emissions field ' // &
+                   TRIM( BaseDct%cName )
+             CALL HCO_Error( msg, RC, thisLoc )
+             RETURN
+          ENDIF
+
+          ! Sanity check: scale field cannot be a base field
+          IF ( ScalDct%DctType == HCO_DCTTYPE_BASE ) THEN
+             msg = 'Wrong scale field type: ' // TRIM(ScalDct%cName)
+             CALL HCO_Error( msg, RC, thisLoc )
+             RETURN
+          ENDIF
+
+          !------------------------------------------------------------------
+          ! Skip this scale factor if no data defined. This is possible
+          ! if scale factors are only defined for a given time range and
+          ! the simulation datetime is outside of this range.
+          !------------------------------------------------------------------
+          IF ( .not. FileData_ArrIsDefined( ScalDct%Dta ) ) THEN
+             IF ( HcoState%Config%doVerbose ) THEN
+                msg = 'Skip scale factor ' // TRIM( ScalDct%cName )       // &
+                     ' because it is not defined for this datetime.'
+                CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+             ENDIF
+             CYCLE
+          ENDIF
+
+          ! Verbose printout
+          IF ( HcoState%Config%doVerbose ) THEN
+             MSG = 'Applying scale factor ' // TRIM(ScalDct%cName)
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          ENDIF
+
+          !------------------------------------------------------------------
+          ! Get vertical extension of this scale factor array.
+          !------------------------------------------------------------------
+          ScalLL = 1
+          IF ( ScalDct%Dta%SpaceDim == 3 ) THEN
+             ScalLL = SIZE( ScalDct%Dta%V3(1)%Val, 3 )
+          ENDIF
+
+          !------------------------------------------------------------------
+          ! Check if there is a mask field associated with this scale
+          ! factor. In this case, get a pointer to the corresponding
+          ! mask field and evaluate scale factors only inside the mask
+          ! region.
+          !------------------------------------------------------------------
+          IF ( ASSOCIATED(ScalDct%Scal_cID) ) THEN
+             CALL Pnt2DataCont( HcoState, ScalDct%Scal_cID(1), MaskDct, RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                msg = 'Could not get mask field for scale factor: ' //       &
+                      TRIM( ScalDct%cName )
+                CALL HCO_Error( msg, RC, thisLoc )
+                RETURN
+             ENDIF
+
+             ! Sanity check: The data container MaskDct must be a mask!
+             IF ( MaskDct%DctType /= HCO_DCTTYPE_MASK ) THEN
+                MSG = 'Invalid mask for scale factor: '                   // &
+                      TRIM( ScalDct%cName ) // '; mask: '                 // &
+                      TRIM( MaskDct%cName )
+                CALL HCO_Error( msg, RC, thisLoc )
+                RETURN
+             ENDIF
+          ENDIF
+
+          ! Set a flag to denote whether MaskDct is associated
+          ! This can be done outside of the parallel loops below
+          isMaskDct = ASSOCIATED( MaskDct )
+
+          !------------------------------------------------------------------
+          ! Apply the mask to the scale factor
+          !------------------------------------------------------------------
+
+          ! Reinitialize error flag. Will be set to > 0 if error occurs,
+          ! and to -1 if negative scale factor is ignored.
+          error = 0
+
+          ! Loop over all latitudes and longitudes
+          !$OMP PARALLEL DO                                                  &
+          !$OMP DEFAULT( SHARED                                             )&
+          !$OMP PRIVATE( I,     J,     tIdx,  tmpVal,    L                  )&
+          !$OMP PRIVATE( LowLL, UppLL, tmpLL, MaskScale, EC                 )&
+          !$OMP COLLAPSE( 2                                                 )&
+          !$OMP SCHEDULE( DYNAMIC, 8                                        )
+          DO J = 1, nJ
+          DO I = 1, nI
+
+             ! Continue to end of loop if an error has occurred
+             ! (we cannot exit from a parallel loop)
+             IF ( error > 0 ) CYCLE
+             ! Get current time index for this container and at this location
+             tIDx = tIDx_GetIndx( HcoState, ScalDct%Dta, I, J )
+             IF ( tIDx < 1 ) THEN
+                WRITE(*,*) 'Cannot get time slice index at location ',I,J,   &
+                           ': ', TRIM(ScalDct%cName), tIDx
+                error = 3
+                CYCLE
+             ENDIF
+
+             !---------------------------------------------------------------
+             ! Check if this is a mask. If so, add mask values to the MASK
+             ! array. For now, we assume masks to be binary, i.e. 0 or 1.
+             ! We may want to change that in future to also support values
+             ! in between. This is especially important when regridding
+             ! high resolution masks onto coarser grids!
+             !---------------------------------------------------------------
+             IF ( ScalDct%DctType == HCO_DCTTYPE_MASK ) THEN
+
+                ! Get mask value
+                CALL GetMaskVal( ScalDct, I, J, TMPVAL, MaskFractions, EC )
+                IF ( EC /= HCO_SUCCESS ) THEN
+                   error = 4
+                   CYCLE
+                ENDIF
+
+                ! Pass to output mask
+                mask(I,J,:) = mask(I,J,:) * TMPVAL
+
+                ! Verbose printout
+                IF ( HcoState%Config%doVerbose .and.                   &
+                     I==1 .AND. J==1                       ) THEN
+                   msg = 'Mask field ' // TRIM( ScalDct%cName )           // &
+                         ' found and added to temporary mask.'
+                   CALL HCO_MSG( msg, LUN=HcoState%Config%hcoLogLUN )
+                ENDIF
+
+                ! Advance to next grid box
+                CYCLE
+             ENDIF
+
+             !---------------------------------------------------------------
+             ! For non-mask fields, apply scale factors to all levels
+             ! of the base field individually. If the scale factor
+             ! field has more than one vertical level, use the
+             ! vertical level closest to the corresponding vertical
+             ! level of the base emission field
+             !---------------------------------------------------------------
+
+             ! Get lower and upper vertical index
+             CALL GetVertIndx( HcoState, BaseDct,       isLevDct1,           &
+                               LevDct1,  LevDct1_Unit,  isLevDct2,           &
+                               LevDct2,  LevDct2_Unit,  I,                   &
+                               J,        LowLL,         UppLL,     EC       )
+
+             ! Trap errors
+             IF ( EC /= HCO_SUCCESS ) THEN
+                error = 1
+                CYCLE
+             ENDIF
+
+             ! Loop over all vertical levels of the base field
+             DO L = LowLL,UppLL
+
+                ! If the vertical level exceeds the number of available
+                ! scale factor levels, use the highest available level.
+                ! Otherwise use the same vertical level index.
+                TmpLL = L
+                IF ( L > ScalLL ) TmpLL = ScalLL
+
+                !------------------------------------------------------------
+                ! Get scale factor for this grid box. Use same uniform
+                ! value if it's a scalar field.
+                !------------------------------------------------------------
+                tmpVal = Get_Value_From_DataCont( I, J, L, tIdX, ScalDct )
+                
+                !---------------------------------------------------------------
+                ! If there is srcGMaskID defined with this scale factors, check
+                ! if scale (mask) in this grid box is equal to srcGMaskID or not.
+                ! if scale(mask) == srcGMaskID, scale = 1, else = 0.
+                !---------------------------------------------------------------
+
+                ! Eventually apply srcGmaskID to set to scale (mask) to binary
+                ! If there is a srcGMaskID applied to this scale factor, 
+                ! then this scale factor is actually a global mask ...
+                IF ( ScalDct%srcGMaskID > 0 ) THEN
+                  ! Set missing mask to 0
+                  IF ( tmpVal == HCO_MISSVAL ) tmpVal = 0.0_sp
+                  IF ( abs(TMPVAL - ScalDct%srcGMaskID) < 0.01_sp ) THEN
+                     tmpval = 1.0_sp
+                  ELSE
+                     tmpval = 0.0_sp
+                  ENDIF
+                ELSE
+                  ! Set missing value to one
+                  IF ( tmpVal == HCO_MISSVAL ) tmpVal = 1.0_sp
+                ENDIF
+
+                !------------------------------------------------------------
+                ! Negative scale factors: proceed according to the "negative
+                ! value" setting specified in the HEMCO configuration file
+                ! NegFlag = 2: Use this value (i.e. pass thru this IF stmt)
+                ! NegFlag = 1: Ignore ands how warning
+                ! NegFlag = 0: Return with error
+                !------------------------------------------------------------
+                IF ( tmpVal < 0.0_sp .and. HcoState%Options%NegFlag /= 2 ) THEN
+
+                   ! NegFlag = 1: ignore and show warning
+                   ! Otherwise return with error
+                   IF ( HcoState%Options%NegFlag == 1 ) THEN
+                      error = -1
+                      CYCLE
+                   ELSE
+                      WRITE(HcoState%Config%stdLogLUN,*) 'Negative scale factor at ', &
+                                     I, J, TmpLL, tidx, ': ',                &
+                                     TRIM(ScalDct%cName), TMPVAL
+                      error = 1
+                      CYCLE
+                   ENDIF
+                ENDIF
+
+                !------------------------------------------------------------
+                ! Apply scale factor in accordance to field operator
+                !------------------------------------------------------------
+                CALL Apply_Scale_Factor( I       = I,                        &
+                                         J       = J,                        &
+                                         L       = L,                        &
+                                         ScalDct = ScalDct,                  &
+                                         scalFac = tmpVal,                   &
+                                         dataVal = outArr_3D(I,J,L),         &
+                                         RC      = EC                       )
+
+                ! Trap errors
+                IF ( EC /= HCO_SUCCESS ) THEN
+                   error = 2
+                   CYCLE
+                ENDIF
+
+             ENDDO
+
+             !---------------------------------------------------------------
+             ! Verbose printout
+             !----------------------------------------------------------------
+             IF ( HcoState%Config%doVerbose  .and.                     &
+                  I == ix .and. J == iy           ) THEN
+                write(MSG,*) 'Scale field ', TRIM(ScalDct%cName)
+                CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+                write(MSG,*) 'Time slice: ', tIdx
+                CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+                write(MSG,*) 'IX, IY: ', IX, IY
+                CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+                write(MSG,*) 'Scale factor (IX,IY,L1): ', TMPVAL
+                CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+                write(MSG,*) 'Mathematical operation : ', ScalDct%Oper
+                CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             ENDIF
+
+          ENDDO !I
+          ENDDO !J
+          !$OMP END PARALLEL DO
+
+          !------------------------------------------------------------------
+          ! Return with error if an error was encountered in the loop above
+          !------------------------------------------------------------------
+          IF ( error > 0 ) THEN
+
+             ! Construct the appropriate error message
+             SELECT CASE( error )
+                CASE( 1 )
+                   msg = 'Negative scale factor found (aborted): '
+                CASE( 2 )
+                   msg = 'Illegal mathematical operator for scale factor: '
+                CASE( 3 )
+                   msg = 'Encountered negative time index for scale factor: '
+                CASE( 4 )
+                   msg = 'Error applying mask to scale factor: '
+                CASE DEFAULT
+                   msg = 'Error when applying scale factor: '
+             END SELECT
+
+             ! Append name of scale factor to error message
+             msg = TRIM( msg ) // TRIM( ScalDct%cName )
+
+             ! Exit with error message
+             ScalDct => NULL()
+             CALL HCO_Error( msg, RC, thisLoc )
+             RETURN
+          ENDIF
+
+          ! eventually prompt warning for negative values
+          IF ( ERROR == -1 ) THEN
+             msg = 'Negative scale factor found (ignored): '              // &
+                    TRIM( ScalDct%cName )
+             IF ( HcoState%Config%doVerbose ) CALL HCO_WARNING( MSG )
+          ENDIF
+
+          ! Free pointer
+          MaskDct => NULL()
+
+       ENDDO ! N
+    ENDIF    ! N > 0
+
+    !========================================================================
+    ! Update optional variables
+    !========================================================================
+    IF ( PRESENT( UseLL) ) THEN
+       UseLL = 1
+       IF ( nnLL > 0 ) UseLL = NINT(REAL(TotLL,kind=sp)/REAL(nnLL,kind=sp))
+    ENDIF
+
+    ! Weight output emissions by mask
+    outArr_3D = outArr_3D * mask
+
+    ! Cleanup and leave w/ success
+    ScalDct => NULL()
+    CALL HCO_Leave( HcoState%Config%Err, RC )
+
+  END SUBROUTINE Get_Current_Emissions
+!EOC
+!------------------------------------------------------------------------------
+!                  GEOS-Chem Global Chemical Transport Model                  !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Get_Value_From_DataCont
+!
+! !DESCRIPTION: Returns a data value stored in a data container at a given
+!  grid box and time.
+!\\
+!\\
+! !INTERFACE:
+!
+  FUNCTION Get_Value_From_DataCont( I, J, L, tIdx, Dct ) RESULT( dataVal )
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,        INTENT(IN) :: I        ! Longitude (or X-dim) index
+    INTEGER,        INTENT(IN) :: J        ! Latitude  (or Y-dim) index
+    INTEGER,        INTENT(IN) :: L        ! Vertical level index
+    INTEGER,        INTENT(IN) :: tIdx     ! Time index
+    TYPE(DataCont), POINTER    :: Dct      ! Data Container object
+!
+! !RETURN VALUE:
+!
+    REAL(sp)                   :: dataVal  ! Data at this grid box and time
+!
+! !REMARKS:
+!  This code was abstracted out of Get_Current_Emisssions for clarity.
+!  We have refactored the code to remove ELSE blocks for better efficiency.
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+
+    ! Data is a 1-D scaler: Return a uniform value
+    IF ( Dct%Dta%SpaceDim == 1 ) THEN
+       dataVal = Dct%Dta%V2(tIDx)%Val(1,1)
+       RETURN
+    ENDIF
+
+    ! Data is a 2-D array: Return value at (I,J)
+    IF ( Dct%Dta%SpaceDim == 2 ) THEN
+       dataVal = Dct%Dta%V2(tIDx)%Val(I,J)
+       RETURN
+    ENDIF
+
+    ! Data is a 3-D array: Return value at (I,J,L)
+    dataVal = Dct%Dta%V3(tIDx)%Val(I,J,L)
+
+  END FUNCTION Get_Value_From_DataCont
+!EOC
+!------------------------------------------------------------------------------
+!                  GEOS-Chem Global Chemical Transport Model                  !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Apply_Dilution_Factor
+!
+! !DESCRIPTION: Applies the dilution factor to input data.  This algorithm
+!  has been abstracted out of Get_Current_Emissions for computational
+!  efficiency.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE Apply_Dilution_Factor( I,       J,         L,      LowLL,       &
+                                    UppLL,   HcoState, BaseDct, inData,      &
+                                    outData, RC                             )
+!
+! !USES:
+!
+    USE HCO_Error_Mod
+    USE HCO_State_Mod, ONLY : HCO_State
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,         INTENT(IN)    :: I         ! Longitude (or X-dim) index
+    INTEGER,         INTENT(IN)    :: J         ! Latitude  (or Y-dim) index
+    INTEGER,         INTENT(IN)    :: L         ! Vertical level index
+    INTEGER,         INTENT(IN)    :: LowLL     ! Lower level for emissions
+    INTEGER,         INTENT(IN)    :: UppLL     ! Upper level for emissions
+    TYPE(DataCont),  POINTER       :: BaseDct   ! Base data container
+    REAL(sp),        INTENT(IN)    :: inData    ! Input data
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER       :: HcoState  ! HEMCO state object
+    REAL(hp),        INTENT(INOUT) :: outData   ! Data w/ dil. factor applied
+!
+! !OUTPUT PARAMETERS:
+!
+    INTEGER,         INTENT(OUT)   :: RC        ! Success or failure
+!
+!
+! !REMARKS:
+!  This code was abstracted out of Get_Current_Emisssions for clarity.  We
+!  have also refactored the code to remove ELSE blocks for better efficiency.
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Scalars
+    REAL(hp)           :: dilFact
+
+    ! Strings
+    CHARACTER(LEN=255) :: errMsg, thisLoc
+
+    !========================================================================
+    ! Apply_Dilution_Factor begins here!
+    !========================================================================
+
+    ! Initialize
+    RC      = HCO_SUCCESS
+    errMsg  = ''
+    thisLoc = 'Apply_Dilution_Factor (in src/Core/hco_calc_mod.F90)'
+    dilFact = 0.0_hp
+
+    !========================================================================
+    ! Get dilution factor. Never dilute 3D emissions.
+    !========================================================================
+    IF ( BaseDct%Dta%SpaceDim == 3 ) THEN
+       outData = inData
+       RETURN
+    ENDIF
+
+    !========================================================================
+    ! If emission level mode is 2, copy emissions to all level
+    ! A separate scale factor should be used to distribute vertically
+    !========================================================================
+    IF ( BaseDct%Dta%EmisLmode == 2 ) THEN
+       outData = inData
+       RETURN
+    ENDIF
+
+    !========================================================================
+    ! Otherwise, compute the vertical dilution factor
+    ! and apply it to the input data.
+    !========================================================================
+    CALL GetDilFact( I          = I,                                         &
+                     J          = J,                                         &
+                     L          = L,                                         &
+                     LowLL      = LowLL,                                     &
+                     UppLL      = UppLL,                                     &
+                     HcoState   = HcoState,                                  &
+                     EmisL1     = BaseDct%Dta%EmisL1,                        &
+                     EmisL1Unit = BaseDct%Dta%EmisL1Unit,                    &
+                     EmisL2     = BaseDct%Dta%EmisL2,                        &
+                     EmisL2Unit = BaseDct%Dta%EmisL2Unit,                    &
+                     DilFact    = dilFact,                                   &
+                     RC         = RC                                        )
+
+    ! Trap error
+    IF ( RC /= HCO_SUCCESS ) THEN
+       WRITE(*,*) 'Error getting dilution factor at ',I,J,&
+            ': ', TRIM(BaseDct%cName)
+       RC = 1
+       RETURN
+    ENDIF
+
+    ! Scale base emission by dilution factor
+    outData = dilFact * inData
+
+  END SUBROUTINE Apply_Dilution_Factor
+!EOC
+!------------------------------------------------------------------------------
+!                  GEOS-Chem Global Chemical Transport Model                  !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Apply_Scale_Factor
+!
+! !DESCRIPTION: Applies scale factors to the input
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE Apply_Scale_Factor( I, J, L, ScalDct, scalFac, dataVal, RC )
+!
+! !USES:
+!
+    USE HCO_Error_Mod
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,        INTENT(IN)    :: I        ! Longitude (or X-dim) index
+    INTEGER,        INTENT(IN)    :: J        ! Latitude  (or Y-dim) index
+    INTEGER,        INTENT(IN)    :: L        ! Vertical level index
+    TYPE(DataCont), POINTER       :: ScalDct  ! Scale Factor data container
+    REAL(sp),       INTENT(IN)    :: scalFac  ! Scale factor
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    REAL(hp),       INTENT(INOUT) :: dataVal  ! Data to be scaled
+!
+! !OUTPUT PARAMETERS:
+!
+    INTEGER,        INTENT(OUT)   :: RC       ! Success or failure
+!
+! !REMARKS:
+!  This code was abstracted out of Get_Current_Emisssions for clarity.  We
+!  have also refactored the code to remove ELSE blocks for better efficiency.
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Strings
+    CHARACTER(LEN=255) :: errMsg, thisLoc
+
+    !========================================================================
+    ! Apply_Scale_Factor begins here!
+    !========================================================================
+
+    ! Initialize
+    RC      = HCO_SUCCESS
+    errMsg  = ''
+    thisLoc = 'Apply_Scale_Factor (src/Core/hco_calc_mod.F90)'
+
+    !------------------------------------------------------------------------
+    ! Operation = 1: multiply
+    !------------------------------------------------------------------------
+    IF ( ScalDct%Oper == 1 ) THEN
+       dataVal = dataVal * scalFac
+       RETURN
+    ENDIF
+
+    !------------------------------------------------------------------------
+    ! Operation = -1: divide
+    !------------------------------------------------------------------------
+    IF ( ScalDct%Oper == -1 ) THEN
+       IF ( scalFac /= 0.0_sp ) THEN
+           dataVal = dataVal / scalFac
+       ENDIF
+       RETURN
+    ENDIF
+
+    !------------------------------------------------------------------------
+    ! Operation = 2: square
+    !------------------------------------------------------------------------
+    IF ( ScalDct%Oper == 2 ) THEN
+       dataVal = dataVal * scalFac * scalFac
+       RETURN
+    ENDIF
+
+    !------------------------------------------------------------------------
+    ! Return w/ error otherwise (Oper 3 is only allowed for masks!)
+    !------------------------------------------------------------------------
+    WRITE( errMsg, * ) 'Illegal operator for: ', TRIM( ScalDct%cName ),      &
+                       ' operation: ', ScalDct%Oper
+    CALL HCO_Error( ErrMsg, RC, thisLoc )
+    RC = 2
+
+  END SUBROUTINE Apply_Scale_Factor
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: HCO_EvalFld_3D
+!
+! !DESCRIPTION: Subroutine HCO\_EvalFld\_3D returns the 3D data field belonging
+!  to the emissions list data container with field name 'cName'. The returned
+!  data field is the completely evaluated field, e.g. the base field multiplied
+!  by all scale factors and with all masking being applied (as specified in the
+!  HEMCO configuration file). This distinguished this routine from HCO\_GetPtr
+!  in hco\_emislist\_mod.F90, which returns a reference to the unevaluated data
+!  field.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE HCO_EvalFld_3D( HcoState, cName, Arr3D, RC, FOUND )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+    USE HCO_DATACONT_MOD, ONLY : ListCont_Find
+!
+! !INPUT PARAMETERS:
+!
+    CHARACTER(LEN=*), INTENT(IN   )  :: cName
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(HCO_State),  POINTER        :: HcoState     ! HEMCO state object
+    REAL(hp),         INTENT(INOUT)  :: Arr3D(:,:,:) ! 3D array
+    INTEGER,          INTENT(INOUT)  :: RC           ! Return code
+!
+! !OUTPUT PARAMETERS:
+!
+    LOGICAL,          INTENT(  OUT), OPTIONAL  :: FOUND
+!
+! !REVISION HISTORY:
+!  11 May 2015 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Scalars
+    LOGICAL                 :: FND
+    INTEGER                 :: AS, nI, nJ, nL, FLAG
+
+    ! Arrays
+    REAL(hp), ALLOCATABLE   :: Mask(:,:,:)
+
+    ! Working pointers: list and data container
+    TYPE(ListCont), POINTER :: Lct
+
+    ! For error handling & verbose mode
+    CHARACTER(LEN=255)      :: MSG
+    CHARACTER(LEN=255)      :: LOC = "HCO_EvalFld_3d (HCO_calc_mod.F90)"
+
+    !=================================================================
+    ! HCO_EvalFld_3D begins here!
+    !=================================================================
+
+    ! Init
+    RC    = HCO_SUCCESS
+    Lct   => NULL()
+    IF ( PRESENT(FOUND) ) FOUND = .FALSE.
+
+    ! Search for base container
+    CALL ListCont_Find ( HcoState%EmisList, TRIM(cName), FND, Lct )
+    IF ( PRESENT(FOUND) ) FOUND = FND
+
+    ! If not found, return here
+    IF ( .NOT. FND ) THEN
+       IF ( PRESENT(FOUND) ) THEN
+          RETURN
+       ELSE
+          MSG = 'Cannot find in EmisList: ' // TRIM(cName)
+          CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Init
+    Arr3D = 0.0_hp
+
+    ! Define output dimensions
+    nI = SIZE(Arr3D,1)
+    nJ = SIZE(Arr3D,2)
+    nL = SIZE(Arr3D,3)
+
+    ! Sanity check: horizontal grid dimensions are expected to be on HEMCO grid
+    IF ( nI /= HcoState%NX .OR. nJ /= HcoState%nY ) THEN
+       WRITE(MSG,*) "Horizontal dimension error: ", TRIM(cName), nI, nJ
+       CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    ! Make sure mask array is defined
+    ALLOCATE(MASK(nI,nJ,nL),STAT=AS)
+    IF ( AS /= 0 ) THEN
+       CALL HCO_ERROR( 'Cannot allocate MASK', RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+    mask = 0.0_hp
+
+    ! Calculate emissions for base container
+    CALL GET_CURRENT_EMISSIONS( HcoState, Lct%Dct, nI,   nJ,                 &
+                                nL,       Arr3D,   Mask, RC                 )
+    IF ( RC /= HCO_SUCCESS ) THEN
+        CALL HCO_ERROR( 'ERROR 14', RC, THISLOC=LOC )
+        RETURN
+    ENDIF
+
+    ! All done
+    IF (ALLOCATED(MASK) ) DEALLOCATE(MASK)
+    Lct => NULL()
+
+  END SUBROUTINE HCO_EvalFld_3D
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: HCO_EvalFld_2D
+!
+! !DESCRIPTION: Subroutine HCO\_EvalFld\_2D returns the 2D data field belonging
+!  to the emissions list data container with field name 'cName'. The returned
+!  data field is the completely evaluated field, e.g. the base field multiplied
+!  by all scale factors and with all masking being applied (as specified in the
+!  HEMCO configuration file). This distinguished this routine from HCO\_GetPtr
+!  in hco\_emislist\_mod.F90, which returns a reference to the unevaluated data
+!  field.
+!\\
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE HCO_EvalFld_2D( HcoState, cName, Arr2D, RC, FOUND )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+    USE HCO_DATACONT_MOD, ONLY : ListCont_Find
+!
+! !INPUT PARAMETERS:
+!
+    CHARACTER(LEN=*), INTENT(IN   )  :: cName
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(HCO_State),  POINTER        :: HcoState     ! HEMCO state object
+    REAL(hp),         INTENT(INOUT)  :: Arr2D(:,:)   ! 2D array
+    INTEGER,          INTENT(INOUT)  :: RC           ! Return code
+!
+! !OUTPUT PARAMETERS:
+!
+    LOGICAL,          INTENT(  OUT), OPTIONAL  :: FOUND
+!
+! !REVISION HISTORY:
+!  11 May 2015 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Scalars
+    LOGICAL                 :: FND
+    INTEGER                 :: AS, nI, nJ, nL, UseLL, FLAG
+
+    ! Arrays
+    REAL(hp), ALLOCATABLE   :: Mask (:,:,:)
+    REAL(hp), ALLOCATABLE   :: Arr3D(:,:,:)
+
+    ! Working pointers: list and data container
+    TYPE(ListCont), POINTER :: Lct
+
+    ! For error handling & verbose mode
+    CHARACTER(LEN=255)      :: MSG
+    CHARACTER(LEN=255)      :: LOC = "HCO_EvalFld_2d (HCO_calc_mod.F90)"
+
+    !=================================================================
+    ! HCO_EvalFld_2D begins here!
+    !=================================================================
+
+    ! Init
+    RC    = HCO_SUCCESS
+    Lct   => NULL()
+    IF ( PRESENT(FOUND) ) FOUND = .FALSE.
+
+    ! Search for base container
+    CALL ListCont_Find ( HcoState%EmisList, TRIM(cName), FND, Lct )
+    IF ( PRESENT(FOUND) ) FOUND = FND
+
+    ! If not found, return here
+    IF ( .NOT. FND ) THEN
+       IF ( PRESENT(FOUND) ) THEN
+          RETURN
+       ELSE
+          MSG = 'Cannot find in EmisList: ' // TRIM(cName)
+          CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Init Arr2D
+    Arr2D = 0.0_hp
+
+    ! Define output dimensions
+    nI = SIZE(Arr2D,1)
+    nJ = SIZE(Arr2D,2)
+    nL = 1
+
+    ! Sanity check: horizontal grid dimensions are expected to be on HEMCO grid
+    IF ( nI /= HcoState%NX .OR. nJ /= HcoState%nY ) THEN
+       WRITE(MSG,*) "Horizontal dimension error: ", TRIM(cName), nI, nJ
+       CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    ! Make sure mask array is defined
+    ALLOCATE(MASK(nI,nJ,nL),Arr3D(nI,nJ,nL),STAT=AS)
+    IF ( AS /= 0 ) THEN
+       CALL HCO_ERROR( 'Cannot allocate MASK', RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+    Arr3D = 0.0_hp
+    Mask  = 0.0_hp
+
+    ! Calculate emissions for base container
+    CALL GET_CURRENT_EMISSIONS( HcoState, Lct%Dct, nI,   nJ,                 &
+                                nL,       Arr3D,   Mask, RC, UseLL=UseLL    )
+    IF ( RC /= HCO_SUCCESS ) THEN
+        CALL HCO_ERROR( 'ERROR 15', RC, THISLOC=LOC )
+        RETURN
+    ENDIF
+
+    ! Place 3D array into 2D array. UseLL returns the vertical level into which
+    ! emissions have been added within GET_CURRENT_EMISSIONS. This should be
+    ! level 1 for most cases but it can be another level if specified so.
+    ! Return a warning if level is not 1 (ckeller, 11/1/16).
+    UseLL = MIN( MAX(useLL,1), SIZE(Arr3D,3) )
+    IF ( UseLL /= 1 ) THEN
+       WRITE(MSG,*) "2D data was emitted above surface - this information might be lost: " , TRIM(cName), UseLL
+       IF ( HcoState%Config%doVerbose ) CALL HCO_WARNING( MSG, THISLOC=LOC )
+    ENDIF
+
+    ! Pass 3D data to 2D array
+    Arr2D = Arr3D(:,:,UseLL)
+
+    ! All done
+    IF (ALLOCATED(MASK ) ) DEALLOCATE(MASK )
+    IF (ALLOCATED(Arr3D) ) DEALLOCATE(Arr3D)
+    Lct => NULL()
+
+  END SUBROUTINE HCO_EvalFld_2D
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: GetMaskVal
+!
+! !DESCRIPTION: Subroutine GetMaskVal is a helper routine to get the mask
+!  value at a given location.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE GetMaskVal ( Dct, I, J, MaskVal, Fractions, RC )
+!
+! !USES:
+!
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,         INTENT(IN   ) :: I                   ! # of lons
+    INTEGER,         INTENT(IN   ) :: J                   ! # of lats
+    LOGICAL,         INTENT(IN   ) :: Fractions           ! Use fractions?
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(DataCont),  POINTER       :: Dct                 ! Mask container
+    REAL(sp),        INTENT(INOUT) :: MaskVal
+    INTEGER,         INTENT(INOUT) :: RC
+!
+! !REVISION HISTORY:
+!  09 Apr 2015 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+
+    !=================================================================
+    ! GetMaskVal begins here
+    !=================================================================
+
+    ! Mask value over this grid box
+    MaskVal = Dct%Dta%V2(1)%Val(I,J)
+
+    ! Negative mask values are treated as zero (exclude).
+    IF ( (MaskVal <= 0.0_sp) .OR. (MaskVal == HCO_MISSVAL) ) THEN
+       MaskVal = 0.0_sp
+    ELSEIF ( MaskVal > 1.0_sp ) THEN
+       MaskVal = 1.0_sp
+    ENDIF
+
+    ! For operator set to 3, mirror value
+    ! MaskVal=1 becomes 0 and MaskVal=0/missing becomes 1
+    IF ( Dct%Oper == 3 ) THEN
+       IF ( (MaskVal == 0.0_sp) .OR. (MaskVal == HCO_MISSVAL) ) THEN
+          MaskVal = 1.0_sp
+       ELSEIF ( MaskVal == 1.0_sp ) THEN
+          MaskVal = 1.0_sp - MaskVal
+       ENDIF
+    ENDIF
+
+    ! Treat as binary?
+    IF ( .NOT. Fractions ) THEN
+       IF ( MaskVal < MASK_THRESHOLD ) THEN
+          MaskVal = 0.0_sp
+       ELSE
+          MaskVal = 1.0_sp
+       ENDIF
+    ENDIF
+
+    ! Return w/ success
+    RC = HCO_SUCCESS
+
+  END SUBROUTINE GetMaskVal
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: HCO_MaskFld
+!
+! !DESCRIPTION: Subroutine HCO\_MaskFld is a helper routine to get the mask
+! field with the given name. The returned mask field is fully evaluated,
+! e.g. the data operation flag associated with this mask field is already
+! taken into account. For instance, if the data operator of a mask field is
+! set to 3, the returned array contains already the mirrored mask values.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE HCO_MaskFld ( HcoState, MaskName, Mask, RC, FOUND )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+    USE HCO_DATACONT_MOD, ONLY : ListCont_Find
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_STATE), POINTER                 :: HcoState
+    CHARACTER(LEN=*),INTENT(IN   )           :: MaskName
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    REAL(sp),        INTENT(INOUT)           :: Mask(:,:)
+    INTEGER,         INTENT(INOUT)           :: RC
+!
+! !OUTPUT PARAMETERS:
+!
+    LOGICAL,         INTENT(  OUT), OPTIONAL :: FOUND
+!
+! !REVISION HISTORY:
+!  11 Jun 2015 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER                 :: I, J, FLAG
+
+    LOGICAL                 :: FND, ERR
+    LOGICAL                 :: Fractions
+
+    TYPE(ListCont), POINTER :: MaskLct
+
+    CHARACTER(LEN=255)      :: MSG
+    CHARACTER(LEN=255)      :: LOC = 'HCO_MaskFld (hco_calc_mod.F90)'
+
+    !=================================================================
+    ! HCO_MaskFld begins here
+    !=================================================================
+
+    ! Nullify
+    MaskLct  => NULL()
+
+    ! Init: default is mask value of 1
+    MASK = 1.0_sp
+    ERR  = .FALSE.
+    FND  = .FALSE.
+
+    ! Search for mask field within EmisList
+    CALL ListCont_Find ( HcoState%EmisList, TRIM(MaskName), FND, MaskLct )
+
+    IF ( .NOT. FND .AND. .NOT. PRESENT(FOUND) ) THEN
+       MSG = 'Cannot find mask field ' // TRIM(MaskName)
+       CALL HCO_MSG(MSG,SEP1='!',LUN=HcoState%Config%hcoLogLUN)
+       MSG = 'Make sure this field is listed in the mask section '  // &
+           'of the HEMCO configuration file. You may also need to ' // &
+           'set the optional attribute `ReadAlways` to `yes`, e.g.'
+       CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       MSG = '5000 TESTMASK     -140/10/-40/90 - - - xy 1 1 -140/10/-40/90 yes'
+       CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       CALL HCO_ERROR ( &
+                        'Error reading mask '//TRIM(MaskName), RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+    IF ( PRESENT(FOUND) ) FOUND = FND
+
+    ! Do only if found
+    IF ( FND ) THEN
+
+       ! Use mask fractions?
+       Fractions = HcoState%Options%MaskFractions
+
+       ! Make sure mask array has correct dimensions
+       IF ( SIZE(MASK,1) /= HcoState%NX .OR. SIZE(MASK,2) /= HcoState%NY ) THEN
+          WRITE(MSG,*) 'Input mask array has wrong dimensions. Must be ', &
+             HcoState%NX, HcoState%NY, ' but found ', SIZE(MASK,1), SIZE(MASK,2)
+          CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+
+       ! Do for every grid box
+       !$OMP PARALLEL DO            &
+       !$OMP DEFAULT( SHARED      ) &
+       !$OMP PRIVATE( I, J        )
+       DO J = 1, HcoState%NY
+       DO I = 1, HcoState%NX
+          CALL GetMaskVal( MaskLct%Dct, I, J, Mask(I,J), Fractions, RC )
+          IF ( RC /= HCO_SUCCESS ) THEN
+             ERR = .TRUE.
+             EXIT
+          ENDIF
+       ENDDO
+       ENDDO
+       !$OMP END PARALLEL DO
+
+       ! Error check
+       IF ( ERR ) THEN
+          MSG = 'Error in GetMaskVal'
+          CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+
+    ENDIF
+
+    ! Free pointer
+    MaskLct  => NULL()
+
+    ! Return w/ success
+    RC = HCO_SUCCESS
+
+  END SUBROUTINE HCO_MaskFld
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: GetVertIndx
+!
+! !DESCRIPTION: Subroutine GetVertIndx is a helper routine to get the vertical
+!  index range of the given data field.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE GetVertIndx( HcoState, Dct,           isLevDct1,                &
+                          LevDct1,  LevDct1_Unit,  isLevDct2,                &
+                          LevDct2,  LevDct2_Unit,  I,                        &
+                          J,        LowLL,         UppLL,     RC            )
+!
+! !USES:
+!
+    USE HCO_State_Mod, ONLY : HCO_State
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER       :: HcoState      ! HEMCO state object
+    LOGICAL,         INTENT(IN)    :: isLevDct1     ! Is LevDct1 not null?
+    TYPE(DataCont),  POINTER       :: LevDct1       ! Level index 1 container
+    INTEGER,         INTENT(IN)    :: LevDct1_Unit  ! LevDct1 unit code
+    LOGICAL,         INTENT(IN)    :: isLevDct2     ! Is LevDct2 not null?
+    TYPE(DataCont),  POINTER       :: LevDct2       ! Level index 2 container
+    INTEGER,         INTENT(IN)    :: LevDct2_Unit  ! LevDct2 unit code
+    INTEGER,         INTENT(IN)    :: I             ! lon index
+    INTEGER,         INTENT(IN)    :: J             ! lat index
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(DataCont),  POINTER       :: Dct           ! Mask container
+    INTEGER,         INTENT(INOUT) :: LowLL         ! lower level index
+    INTEGER,         INTENT(INOUT) :: UppLL         ! upper level index
+    INTEGER,         INTENT(INOUT) :: RC
+!
+! !REVISION HISTORY:
+!  06 May 2016 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER             :: EmisLUnit
+    REAL(hp)            :: EmisL
+    CHARACTER(LEN=255)  :: errMsg, thisLoc
+
+    !=======================================================================
+    ! GetVertIndx begins here
+    !=======================================================================
+
+    ! Initialize
+    RC      = HCO_SUCCESS
+    errMsg  = ''
+    thisLoc = 'GetVertIndx (src/Core/hco_calc_mod.F90)'
+
+    !-----------------------------------------------------------------------
+    ! Get vertical extension of base emission array.
+    !
+    ! Unlike the output array OUTARR_3D, the data containers do not
+    ! necessarily extent over the entire troposphere but only cover
+    ! the effectively filled vertical levels. For most inventories,
+    ! this is only the first model level.
+    !-----------------------------------------------------------------------
+    IF ( Dct%Dta%SpaceDim == 3 ) THEN
+       LowLL = 1
+       UppLL = SIZE( Dct%Dta%V3(1)%Val, 3 )
+       RC    = HCO_SUCCESS
+       RETURN
+    ENDIF
+
+    !-----------------------------------------------------------------------
+    ! For 2D field, check if it shall be spread out over multiple
+    ! levels. Possible to go from PBL to max. specified level.
+    !-----------------------------------------------------------------------
+
+    ! Lower level
+    ! --> Check if scale factor is used to determine lower and/or
+    !     upper level
+    !
+    ! NOTE: Get rid of ELSE block for efficiency (bmy, 09 Mar 2023)
+    EmisL     = Dct%Dta%EmisL1
+    EmisLUnit = Dct%Dta%EmisL1Unit
+
+    IF ( isLevDct1 ) THEN
+       EmisL = GetEmisL( HcoState, LevDct1, I, J )
+       IF ( EmisL < 0.0_hp ) THEN
+          RC = HCO_FAIL
+          RETURN
+       ENDIF
+       EmisLUnit = LevDct1_Unit
+    ENDIF
+
+    CALL GetIdx( HcoState, I, J, EmisL, EmisLUnit, LowLL, RC )
+    IF ( RC /= HCO_SUCCESS ) THEN
+       errMsg = 'Error encountered in rouitine "GetIdx" (for LevDct1)!'
+       CALL HCO_ERROR( errMsg, RC, thisLoc )
+       RETURN
+    ENDIF
+
+    ! Upper level
+    ! NOTE: Get rid of ELSE block for efficiency (bmy, 09 Mar 2023)
+    EmisL     = Dct%Dta%EmisL2
+    EmisLUnit = Dct%Dta%EmisL2Unit
+
+    IF ( isLevDct2 ) THEN
+       EmisL = GetEmisL( HcoState, LevDct2, I, J )
+       IF ( EmisL < 0.0_hp ) THEN
+          RC = HCO_FAIL
+          RETURN
+       ENDIF
+       EmisLUnit = LevDct2_Unit
+    ENDIF
+
+    CALL GetIdx( HcoState, I, J, EmisL, EmisLUnit, UppLL, RC )
+    IF ( RC /= HCO_SUCCESS ) THEN
+       errMsg = 'Error encountered in rouitine "GetIdx" (for LevDct2)!'
+       CALL HCO_ERROR( errMsg, RC, thisLoc )
+       RETURN
+    ENDIF
+
+    ! Upper level must not be lower than lower level
+    UppLL = MAX(LowLL, UppLL)
+
+    ! Return w/ success
+    RC = HCO_SUCCESS
+
+  END SUBROUTINE GetVertIndx
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !FUNCTION: GetEmisL
+!
+! !DESCRIPTION: Returns the emission level read from a scale factor.
+!\\
+!\\
+! !INTERFACE:
+!
+  FUNCTION GetEmisL( HcoState, LevDct, I, J ) RESULT ( EmisL )
+!
+! !USES:
+!
+    USE HCO_TYPES_MOD
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+    USE HCO_tIdx_MOD,     ONLY : tIDx_GetIndx
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER        :: HcoState       ! HEMCO state object
+    TYPE(DataCont),  POINTER        :: LevDct         ! Level index 1 container
+    INTEGER,         INTENT(IN   )  :: I, J           ! horizontal index
+!
+! !RETURN VALUE:
+!
+    REAL(hp)                        :: EmisL
+!
+! !REVISION HISTORY:
+!  26 Jan 2018 - C. Keller - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER  :: levtidx
+
+    !=================================================================
+    ! GetEmisL begins here
+    !=================================================================
+    levtidx = tIDx_GetIndx( HcoState, LevDct%Dta, I, J )
+    IF ( levtidx <= 0 ) THEN
+       WRITE(*,*)' Cannot get time slice for field '//&
+       TRIM(LevDct%cName)//': GetEmisL (hco_calc_mod.F90)'
+       EmisL = -1.0
+       RETURN
+    ENDIF
+
+    IF ( LevDct%Dta%SpaceDim == 1 ) THEN
+       EmisL = LevDct%Dta%V2(levtidx)%Val(1,1)
+    ELSEIF ( LevDct%Dta%SpaceDim == 2 ) THEN
+       EmisL = LevDct%Dta%V2(levtidx)%Val(I,J)
+    ELSEIF ( LevDct%Dta%SpaceDim == 3 ) THEN
+       EmisL = LevDct%Dta%V3(levtidx)%Val(I,J,1)
+    ENDIF
+
+    IF ( EmisL == HCO_MISSVAL ) EmisL = 0.0_hp
+
+END FUNCTION GetEmisL
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !FUNCTION: GetEmisLUnit
+!
+! !DESCRIPTION: Returns the emission level unit read from a scale factor.
+!\\
+!\\
+! !INTERFACE:
+!
+  FUNCTION GetEmisLUnit( HcoState, LevDct ) RESULT( EmisLUnit )
+!
+! !USES:
+!
+    USE HCO_TYPES_MOD
+    USE HCO_STATE_MOD, ONLY : HCO_State
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER        :: HcoState       ! HEMCO state object
+    TYPE(DataCont),  POINTER        :: LevDct         ! Level index 1 container
+!
+! !RETURN VALUE:
+!
+    INTEGER                         :: EmisLUnit
+!
+! !REVISION HISTORY:
+!  26 Jan 2018 - C. Keller - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    !=================================================================
+    ! GetEmisLUnit begins here
+    !=================================================================
+
+    ! For now, only meters are supported
+    EmisLUnit = HCO_EMISL_M
+
+    ! Dummy check that units on field are actually in meters
+    IF ( TRIM(LevDct%Dta%OrigUnit) /= 'm' .AND. &
+         TRIM(LevDct%Dta%OrigUnit) /= '1'        ) THEN
+       WRITE(*,*) TRIM(LevDct%cName)// &
+       ' must have units of `m`, instead found '//&
+       TRIM(LevDct%Dta%OrigUnit)//': GetEmisLUnit (hco_calc_mod.F90)'
+       EmisLUnit = -1
+    ENDIF
+
+END FUNCTION GetEmisLUnit
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: GetIdx
+!
+! !DESCRIPTION: Subroutine GetIdx is a helper routine to return the vertical
+!  level index for a given altitude. The altitude can be provided in level
+!  coordinates, in units of meters or as the 'PBL mixing height'.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE GetIdx( HcoState, I, J, alt, altu, lidx, RC )
+!
+! !USES:
+!
+    USE HCO_TYPES_MOD
+    USE HCO_STATE_MOD,   ONLY : HCO_STATE
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER        :: HcoState       ! HEMCO state object
+    INTEGER,         INTENT(IN   )  :: I, J           ! horizontal index
+    INTEGER,         INTENT(IN   )  :: altu           ! altitude unit
+!
+! !OUTPUT PARAMETERS:
+!
+    INTEGER,         INTENT(  OUT)  :: lidx           ! level index
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    REAL(hp),        INTENT(INOUT)  :: alt            ! altitude
+    INTEGER,         INTENT(INOUT)  :: RC
+!
+! !REMARKS:
+!  The code was refactored to avoid ELSE blocks (which are computationally
+!  expensive) following the "never-nesting" technique. (Bob Y., 10 Mar 2023)
+!
+! !REVISION HISTORY:
+!  09 May 2016 - C. Keller - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER                 :: L
+    REAL(hp)                :: altb, altt
+    CHARACTER(LEN=255)      :: MSG
+    CHARACTER(LEN=255)      :: LOC = 'GetIdx (hco_calc_mod.F90)'
+
+    !=================================================================
+    ! HCO_GetIdx begins here
+    !=================================================================
+
+    ! Init
+    RC = HCO_SUCCESS
+
+    ! Input data is in level coordinates;
+    ! Return the corresponding level index
+    IF ( altu == HCO_EMISL_LEV ) THEN
+       lidx = INT( alt )
+       RETURN
+    ENDIF
+
+    ! Input specifies the top-of-atmosphere;
+    ! Return the top-of-atmosphere level index
+    IF ( altu == HCO_EMISL_TOP ) THEN
+       lidx = HCOState%NZ
+       RETURN
+    ENDIF
+
+    ! Input data is in meters or specifies the PBL top;
+    ! Find the corresponding level index
+    IF ( altu == HCO_EMISL_M .OR. altu == HCO_EMISL_PBL ) THEN
+
+       ! Eventually get altitude from PBL height
+       IF ( altu == HCO_EMISL_PBL ) THEN
+          alt = HcoState%Grid%PBLHEIGHT%Val(I,J)
+       ENDIF
+
+       ! Special case of negative height
+       IF ( alt <= 0.0_hp ) THEN
+          lidx = 1
+          RETURN
+       ENDIF
+
+       ! Loop over data until we are within desired level
+       ! NOTE: This can be rewritten more efficiently (bmy, 3/5/21)
+       altt = 0.0_hp
+       altb = 0.0_hp
+       lidx = -1
+       DO L = 1, HcoState%NZ
+          altt = altb + HcoState%Grid%BXHEIGHT_M%Val(I,J,L)
+          IF ( alt >= altb .AND. alt < altt ) THEN
+             lidx = L
+             RETURN
+          ENDIF
+          altb = altt
+       ENDDO
+
+       ! If altitude is above maximum level
+       IF ( lidx == -1 .AND. alt >= altt ) THEN
+          lidx = HcoState%NZ
+          WRITE(MSG,*)                                                       &
+               'Level is above max. grid box level - use top level ', alt
+          IF ( HcoState%Config%doVerbose ) CALL HCO_WARNING( MSG, THISLOC=LOC )
+          RETURN
+       ENDIF
+
+       RETURN
+    ENDIF
+
+    ! Error if we drop down to here
+    MSG = 'Illegal altitude unit'
+    CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+
+  END SUBROUTINE GetIdx
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: GetDilFact
+!
+! !DESCRIPTION: Subroutine GetDilFact returns the vertical dilution factor,
+! that is the factor that is to be applied to distribute emissions into
+! multiple vertical levels. If grid box height information are available,
+! these are used to compute the distribution factor. Otherwise, equal weight
+! is given to all vertical levels.
+!\\
+!\\
+! !TODO: Dilution factors are currently only weighted by grid box heights
+! (if these information are available) but any pressure information are
+! ignored.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE GetDilFact( HcoState,   EmisL1, EmisL1Unit, EmisL2,             &
+                         EmisL2Unit, I,      J,          L,                  &
+                         LowLL,      UppLL,  DilFact,    RC                 )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,    ONLY : HCO_State
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER       :: HcoState    ! HEMCO state object
+    INTEGER,         INTENT(IN)    :: I           ! lon index
+    INTEGER,         INTENT(IN)    :: J           ! lat index
+    INTEGER,         INTENT(IN)    :: L           ! lev index
+    INTEGER,         INTENT(IN)    :: LowLL       ! lower level index
+    INTEGER,         INTENT(IN)    :: UppLL       ! upper level index
+!
+! !OUTPUT PARAMETERS:
+!
+    REAL(hp),        INTENT(OUT)   :: DilFact     ! Dilution factor
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    REAL(hp),        INTENT(INOUT) :: EmisL1
+    INTEGER,         INTENT(INOUT) :: EmisL1Unit
+    REAL(hp),        INTENT(INOUT) :: EmisL2
+    INTEGER,         INTENT(INOUT) :: EmisL2Unit
+    INTEGER,         INTENT(INOUT) :: RC
+!
+! !REVISION HISTORY:
+!  06 May 2016 - C. Keller   - Initial Version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER            :: L1
+    CHARACTER(LEN=255) :: MSG
+    CHARACTER(LEN=255) :: LOC = 'GetDilFact (hco_calc_mod.F90)'
+    REAL(hp)           :: h1, h2, dh, dh1, dh2
+    REAL(hp)           :: UppLLR, LowLLR
+
+    !=================================================================
+    ! GetDilFact begins here
+    !=================================================================
+
+    ! Init
+    DilFact = 1.0_hp
+    RC = HCO_SUCCESS
+
+    ! Nothing to do if it's only one level
+    IF ( LowLL == UppLL ) RETURN
+
+    ! Compute dilution factor based on boxheights if this information
+    ! is available
+    IF ( ASSOCIATED( HcoState%Grid%BXHEIGHT_M%Val ) ) THEN
+
+       ! Get height of bottom level LowLL (in m)
+       IF ( EmisL1Unit == HCO_EMISL_M ) THEN
+          h1 = EmisL1
+       ELSEIF ( EmisL1Unit == HCO_EMISL_PBL ) THEN
+          h1 = HcoState%Grid%PBLHEIGHT%Val(I,J)
+       ELSE
+          IF ( LowLL > 1 ) THEN
+             h1 = SUM(HcoState%Grid%BXHEIGHT_M%Val(I,J,1:(LowLL-1)))
+          ELSE
+             h1 = 0.0_hp
+          ENDIF
+       ENDIF
+
+       ! Get height of top level UppLL (in m)
+       IF ( EmisL2Unit == HCO_EMISL_M ) THEN
+          h2 = EmisL2
+       ELSEIF ( EmisL2Unit == HCO_EMISL_PBL ) THEN
+          h2 = HcoState%Grid%PBLHEIGHT%Val(I,J)
+       ELSE
+          h2 = SUM(HcoState%Grid%BXHEIGHT_M%Val(I,J,1:UppLL))
+       ENDIF
+
+       ! If vertical weight option is enabled, calculate vertical
+       ! distribution factor relative to the grid cell heights. This
+       ! is the default (and recommended) option as this makes sure
+       ! that the same amount of mass is emitted into each layer.
+       IF ( HcoState%Options%VertWeight ) THEN
+
+          ! Height of grid box of interest (in m)
+          dh = HcoState%Grid%BXHEIGHT_M%Val(I,J,L)
+
+          ! Adjust dh if we are in lowest level
+          IF ( L == LowLL ) THEN
+             dh = SUM(HcoState%Grid%BXHEIGHT_M%Val(I,J,1:LowLL)) - h1
+          ENDIF
+
+          ! Adjust dh if we are in top level
+          IF ( L == UppLL ) THEN
+             dh = h2 - SUM(HcoState%Grid%BXHEIGHT_M%Val(I,J,1:(UppLL-1)))
+          ENDIF
+
+          ! compute dilution factor: the new flux should emit the same mass per
+          ! volume, i.e. flux_total/column_total = flux_level/column_level
+          ! --> flux_level = fluxtotal * column_level / column_total.
+          IF ( h2 > h1 ) THEN
+             DilFact = dh / ( h2 - h1 )
+          ELSE
+             MSG = 'GetDilFact h2 not greater than h1'
+             CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+             RETURN
+          ENDIF
+
+       ! If VertWeight option is turned off, emit the same flux in each layer.
+       ! Since model layers have different depths, this will result in differnt
+       ! total emissions per layer.
+       ELSE
+
+          ! Get fractional layer indeces for lower and upper level. This makes
+          ! sure that only fractions of the lower and upper level are being
+          ! considered, so that double-counting is avoided if a model layer
+          ! serves both as the top layer and the bottom layer (e.g., wildfire
+          ! emissions emitted from bottom to the top of PBL, and from the top
+          ! of PBL to 5000m).
+          LowLLR = REAL(LowLL,hp) - 1.0_hp
+          UppLLR = REAL(UppLL,hp)
+          dh1 = 0.0_hp
+          DO L1 = 1, HcoState%NZ
+             dh2 = SUM(HcoState%Grid%BXHEIGHT_M%Val(I,J,1:L1))
+             IF ( h1 >= dh1 .AND. h1 < dh2 ) THEN
+                LowLLR = REAL(L1,hp) - ( (dh2-h1)/(dh2-dh1) )
+             ENDIF
+             IF ( h2 > dh1 .AND. h2 <= dh2 ) THEN
+                UppLLR = REAL(L1,hp) - ( (dh2-h2)/(dh2-dh1) )
+             ENDIF
+             ! top layer is bottom layer in next loop
+             dh1 = dh2
+          ENDDO
+
+          ! Dilution factor using fractional levels
+          IF ( UppLLR <= LowLLR ) THEN
+             DilFact = 1.0_hp / REAL(UppLL-LowLL+1,hp)
+          ELSE
+             DilFact = 1.0_hp / (UppLLR-LowLLR)
+          ENDIF
+
+       ENDIF
+
+    ! Approximate dilution factor otherwise
+    ELSE
+
+       DilFact = 1.0_hp / REAL(UppLL-LowLL+1,hp)
+    ENDIF
+
+    ! Return w/ success
+    RC = HCO_SUCCESS
+
+  END SUBROUTINE GetDilFact
+#ifdef ADJOINT
+!BOP
+!
+! !IROUTINE: Get_Current_Emissions
+!
+! !DESCRIPTION: Subroutine Get\_Current\_Emissions calculates the current
+!  emissions for the specified emission container.
+!  This subroutine is only called by HCO\_CalcEmis and for base emission
+!  containers, i.e. containers of type 1.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE Get_Current_Emissions_Adj( HcoState, BaseDct,   &
+                                    nI, nJ, nL, OUTARR_3D, MASK, RC, UseLL )
+!
+! !USES:
+!
+    USE HCO_State_Mod,    ONLY : HCO_State
+    USE HCO_tIdx_MOD,     ONLY : tIDx_GetIndx
+    USE HCO_FileData_Mod, ONLY : FileData_ArrIsDefined
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,           INTENT(IN)  :: nI                  ! # of lons
+    INTEGER,           INTENT(IN)  :: nJ                  ! # of lats
+    INTEGER,           INTENT(IN)  :: nL                  ! # of levs
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+
+    TYPE(HCO_State), POINTER       :: HcoState            ! HEMCO state object
+    TYPE(DataCont),  POINTER       :: BaseDct             ! base emission
+                                                          !  container
+    REAL(hp),        INTENT(INOUT) :: OUTARR_3D(nI,nJ,nL) ! output array
+    REAL(hp),        INTENT(INOUT) :: MASK     (nI,nJ,nL) ! mask array
+    INTEGER,         INTENT(INOUT) :: RC
+!
+! !OUTPUT PARAMETERS:
+!
+    INTEGER,         INTENT(  OUT), OPTIONAL :: UseLL
+!
+! !REMARKS:
+!  This routine uses multiple loops over all grid boxes (base emissions
+!  and scale factors use separate loops). In an OMP environment, this approach
+!  seems to be faster than using only one single loop (but repeated calls to
+!  point to containers, etc.). The alternative approach is used in routine
+!  Get\_Current\_Emissions\_B at the end of this module and may be employed
+!  on request.
+!
+! !REVISION HISTORY:
+!  25 Aug 2012 - C. Keller   - Initial Version
+!  09 Nov 2012 - C. Keller   - MASK update. Masks are now treated
+!                              separately so that multiple masks can be
+!                              added.
+!  06 Jun 2014 - R. Yantosca - Cosmetic changes in ProTeX headers
+!  07 Sep 2014 - C. Keller   - Mask update. Now set mask to zero as soon as
+!                              on of the applied masks is zero.
+!  03 Dec 2014 - C. Keller   - Now calculate time slice index on-the-fly.
+!  29 Dec 2014 - C. Keller   - Added scale factor masks.
+!  02 Mar 2015 - C. Keller   - Now check for missing values. Missing values are
+!                              excluded from emission calculation.
+!  26 Oct 2016 - R. Yantosca - Don't nullify local ptrs in declaration stmts
+!  11 May 2017 - C. Keller   - Added universal scaling
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    ! Pointers
+    TYPE(DataCont), POINTER :: ScalDct
+    TYPE(DataCont), POINTER :: MaskDct
+    TYPE(DataCont), POINTER :: LevDct1
+    TYPE(DataCont), POINTER :: LevDct2
+
+    ! Scalars
+    REAL(sp)                :: TMPVAL, MaskScale
+    REAL(hp)                :: DilFact
+    REAL(hp)                :: ScalFact
+    INTEGER                 :: tIDx, IDX
+    INTEGER                 :: I, J, L, N
+    INTEGER                 :: LowLL, UppLL, ScalLL, TmpLL
+    INTEGER                 :: ERROR
+    INTEGER                 :: TotLL, nnLL
+    CHARACTER(LEN=255)      :: MSG, LOC
+    LOGICAL                 :: NegScalExist
+    LOGICAL                 :: MaskFractions
+    LOGICAL                 :: isLevDct1
+    LOGICAL                 :: isLevDct2
+    LOGICAL                 :: isMaskDct
+    LOGICAL                 :: isPblHt
+    LOGICAL                 :: isBoxHt
+    INTEGER                 :: LevDct1_Unit
+    INTEGER                 :: LevDct2_Unit
+
+    ! testing only
+    INTEGER                 :: IX, IY
+
+    !=================================================================
+    ! GET_CURRENT_EMISSIONS begins here
+    !=================================================================
+
+    ! Initialize
+    ScalDct => NULL()
+    MaskDct => NULL()
+    LOC     = 'GET_CURRENT_EMISSIONS_ADJ (hco_calc_mod.F90)'
+
+    ! Enter
+    CALL HCO_ENTER(HcoState%Config%Err, LOC, RC )
+    IF(RC /= HCO_SUCCESS) RETURN
+
+    ! testing only:
+    IX = 3 !-1
+    IY = 8 !-1
+
+    ! Check if container contains data
+    IF ( .NOT. FileData_ArrIsDefined(BaseDct%Dta) ) THEN
+       MSG = 'Array not defined: ' // TRIM(BaseDct%cName)
+       CALL HCO_ERROR( MSG, RC )
+       RETURN
+    ENDIF
+
+    ! Initialize mask. By default, assume that we use all grid boxes.
+    MASK(:,:,:)  = 1.0_hp
+    MaskFractions = HcoState%Options%MaskFractions
+
+    ! Verbose
+    IF ( HcoState%Config%doVerbose ) THEN
+       WRITE(MSG,*) 'Evaluate field ', TRIM(BaseDct%cName)
+       CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+    ENDIF
+
+    ! ----------------------------------------------------------------
+    ! Set base emissions
+    ! ----------------------------------------------------------------
+
+    ! Initialize ERROR. Will be set to 1 if error occurs below
+    ERROR = 0
+
+    ! Initialize variables to compute average vertical level index
+    totLL = 0
+    nnLL  = 0
+
+    ! Check for level index containers
+    IF ( BaseDct%levScalID1 > 0 ) THEN
+       CALL Pnt2DataCont( HcoState, BaseDct%levScalID1, LevDct1, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+           CALL HCO_ERROR( 'ERROR 18', RC, THISLOC=LOC )
+           RETURN
+       ENDIF
+    ELSE
+       LevDct1 => NULL()
+    ENDIF
+    IF ( BaseDct%levScalID2 > 0 ) THEN
+       CALL Pnt2DataCont( HcoState, BaseDct%levScalID2, LevDct2, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+           CALL HCO_ERROR( 'ERROR 19', RC, THISLOC=LOC )
+           RETURN
+       ENDIF
+    ELSE
+       LevDct2 => NULL()
+    ENDIF
+
+    ! Test whether LevDct1 and LevDct2 are associated
+    isLevDct1 = ASSOCIATED( LevDct1 )
+    isLevDct2 = ASSOCIATED( LevDct2 )
+
+    ! Get the units of LevDct1 (if it exists)
+    IF ( isLevDct1 ) THEN
+       LevDct1_Unit = GetEmisLUnit( HcoState, LevDct1 )
+       IF ( LevDct1_Unit < 0 ) THEN
+          MSG = 'LevDct1 units are not defined!'
+          CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+          RC = HCO_FAIL
+          RETURN
+       ENDIF
+    ELSE
+       LevDct1_Unit = -1
+    ENDIF
+
+    ! Get the units of LevDct2 (if it exists)
+    IF ( isLevDct2 ) THEN
+       LevDct2_Unit = GetEmisLUnit( HcoState, LevDct2 )
+       IF ( LevDct2_Unit < 0 ) THEN
+          MSG = 'LevDct2_Units are not defined!'
+          CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+    ELSE
+       LevDct2_Unit = -1
+    ENDIF
+
+    ! Throw an error if boxheight is missing and the units are in meters
+    IF ( LevDct1_Unit == HCO_EMISL_M  .or.                                  &
+         LevDct2_Unit == HCO_EMISL_M ) THEN
+       IF ( .NOT. ASSOCIATED(HcoState%Grid%BXHEIGHT_M%Val) ) THEN
+          MSG = 'Boxheight (in meters) is missing in HEMCO state'
+          CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Throw an error if boxheight is missing and the units are in PBL frac
+    IF ( LevDct1_Unit == HCO_EMISL_PBL  .or.                                &
+         LevDct2_Unit == HCO_EMISL_PBL ) THEN
+       IF ( .NOT. ASSOCIATED(HcoState%Grid%PBLHEIGHT%Val) ) THEN
+          MSG = 'Boundary layer height is missing in HEMCO state'
+          CALL HCO_ERROR ( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+    ENDIF
+
+    ! Loop over all latitudes and longitudes
+!$OMP PARALLEL DO                                                            &
+!$OMP DEFAULT( SHARED                                                       )&
+!$OMP PRIVATE( I, J, L, tIdx, TMPVAL, DilFact, LowLL, UppLL                 )&
+!$OMP COLLAPSE( 2                                                           )&
+!$OMP SCHEDULE( DYNAMIC, 4                                                  )&
+!$OMP REDUCTION( +:totLL                                                    )&
+!$OMP REDUCTION( +:nnLL                                                     )
+    DO J = 1, nJ
+    DO I = 1, nI
+
+       ! Zero for safety's sake
+       totLL = 0
+       nnLL  = 0
+
+       ! Get current time index for this container and at this location
+       tIDx = tIDx_GetIndx( HcoState, BaseDct%Dta, I, J )
+       IF ( tIDx < 1 ) THEN
+          WRITE(MSG,*) 'Cannot get time slice index at location ',I,J,&
+                       ': ', TRIM(BaseDct%cName), tIDx
+          ERROR = 1
+          EXIT
+       ENDIF
+
+       ! Get lower and upper vertical index
+       CALL GetVertIndx ( HcoState,     BaseDct,   isLevDct1, LevDct1,       &
+                          LevDct1_Unit, isLevDct2, LevDct2,   LevDct2_Unit,  &
+                          I,            J,         LowLL,     UppLL,         &
+                          RC                                                )
+       IF ( RC /= HCO_SUCCESS ) THEN
+          WRITE(MSG,*) 'Error getting vertical index at location ',I,J,&
+                       ': ', TRIM(BaseDct%cName)
+          ERROR = 1 ! Will cause error
+          EXIT
+       ENDIF
+
+       ! average upper level
+       totLL = totLL + UppLL
+       nnLL  = nnLL + 1
+
+       ! Loop over all levels
+       DO L = LowLL, UppLL
+
+          ! Get base value. Use uniform value if scalar field.
+          IF ( BaseDct%Dta%SpaceDim == 1 ) THEN
+             TMPVAL = BaseDct%Dta%V2(tIDx)%Val(1,1)
+          ELSEIF ( BaseDct%Dta%SpaceDim == 2 ) THEN
+             TMPVAL = BaseDct%Dta%V2(tIDx)%Val(I,J)
+          ELSE
+             TMPVAL = BaseDct%Dta%V3(tIDx)%Val(I,J,L)
+          ENDIF
+
+          ! If it's a missing value, mask box as unused and set value to zero
+          IF ( TMPVAL == HCO_MISSVAL ) THEN
+             MASK(I,J,:)      = 0.0_hp
+             OUTARR_3D(I,J,L) = 0.0_hp
+
+          ! Pass base value to output array
+          ELSE
+
+             ! Get dilution factor. Never dilute 3D emissions.
+             IF ( BaseDct%Dta%SpaceDim == 3 ) THEN
+                DilFact = 1.0_hp !1.0
+
+             ! 2D dilution factor
+             ELSE
+                CALL GetDilFact ( HcoState,    BaseDct%Dta%EmisL1, &
+                                  BaseDct%Dta%EmisL1Unit, BaseDct%Dta%EmisL2,  &
+                                  BaseDct%Dta%EmisL2Unit, I, J, L, LowLL,  &
+                                  UppLL, DilFact, RC )
+                IF ( RC /= HCO_SUCCESS ) THEN
+                   WRITE(MSG,*) 'Error getting dilution factor at ',I,J,&
+                                ': ', TRIM(BaseDct%cName)
+                   ERROR = 1
+                   EXIT
+                ENDIF
+             ENDIF
+
+             ! Scale base emission by dilution factor
+             OUTARR_3D(I,J,L) = DilFact * TMPVAL
+          ENDIF
+       ENDDO !L
+
+    ENDDO !I
+    ENDDO !J
+!$OMP END PARALLEL DO
+
+    ! Check for error
+    IF ( ERROR == 1 ) THEN
+       CALL HCO_ERROR( MSG, RC )
+       RETURN
+    ENDIF
+
+    ! ----------------------------------------------------------------
+    ! Apply scale factors
+    ! The container IDs of all scale factors associated with this base
+    ! container are stored in vector Scal_cID.
+    ! ----------------------------------------------------------------
+
+    ! Loop over scale factors
+    IF ( BaseDct%nScalID > 0 ) THEN
+
+    DO N = 1, BaseDct%nScalID
+
+       ! Get the scale factor container ID for the current slot
+       IDX = BaseDct%Scal_cID(N)
+
+       ! Point to data container with the given container ID
+       CALL Pnt2DataCont( HcoState, IDX, ScalDct, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+           CALL HCO_ERROR( 'ERROR 20', RC, THISLOC=LOC )
+           RETURN
+       ENDIF
+
+       ! Sanity check: scale field cannot be a base field
+       IF ( (ScalDct%DctType == HCO_DCTTYPE_BASE) ) THEN
+          MSG = 'Wrong scale field type: ' // TRIM(ScalDct%cName)
+          CALL HCO_ERROR( MSG, RC )
+          RETURN
+       ENDIF
+
+       ! Skip this scale factor if no data defined. This is possible
+       ! if scale factors are only defined for a given time range and
+       ! the simulation datetime is outside of this range.
+       IF ( .NOT. FileData_ArrIsDefined(ScalDct%Dta) ) THEN
+          IF ( HcoState%Config%doVerbose ) THEN
+             MSG = 'Skip scale factor '//TRIM(ScalDct%cName)// &
+                   ' because it is not defined for this datetime.'
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          ENDIF
+          CYCLE
+       ENDIF
+
+       ! Verbose mode
+       IF ( HcoState%Config%doVerbose ) THEN
+          MSG = 'Applying scale factor ' // TRIM(ScalDct%cName)
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+       ! Get vertical extension of this scale factor array.
+       IF( (ScalDct%Dta%SpaceDim<=2) ) THEN
+          ScalLL = 1
+       ELSE
+          ScalLL = SIZE(ScalDct%Dta%V3(1)%Val,3)
+       ENDIF
+
+       ! Check if there is a mask field associated with this scale
+       ! factor. In this case, get a pointer to the corresponding
+       ! mask field and evaluate scale factors only inside the mask
+       ! region.
+       IF ( ASSOCIATED(ScalDct%Scal_cID) ) THEN
+          CALL Pnt2DataCont( HcoState, ScalDct%Scal_cID(1), MaskDct, RC )
+          IF ( RC /= HCO_SUCCESS ) THEN
+              CALL HCO_ERROR( 'ERROR 21', RC, THISLOC=LOC )
+              RETURN
+          ENDIF
+
+          ! Must be mask field
+          IF ( MaskDct%DctType /= HCO_DCTTYPE_MASK ) THEN
+             MSG = 'Invalid mask for scale factor: '//TRIM(ScalDct%cName)
+             MSG = TRIM(MSG) // '; mask: '//TRIM(MaskDct%cName)
+             CALL HCO_ERROR( MSG, RC )
+             RETURN
+          ENDIF
+       ENDIF
+
+       ! Reinitialize error flag. Will be set to 1 or 2 if error occurs,
+       ! and to -1 if negative scale factor is ignored.
+       ERROR = 0
+
+       ! Loop over all latitudes and longitudes
+!$OMP PARALLEL DO                                                            &
+!$OMP DEFAULT( SHARED )                                                      &
+!$OMP PRIVATE( I, J, tIdx, TMPVAL, L, LowLL, UppLL, tmpLL, MaskScale        )&
+!$OMP COLLAPSE( 2                                                           )&
+!$OMP SCHEDULE( DYNAMIC, 4                                                  )
+       DO J = 1, nJ
+       DO I = 1, nI
+
+          ! ------------------------------------------------------------
+          ! If there is a mask associated with this scale factors, check
+          ! if this grid box is within or outside of the mask region.
+          ! Values that partially fall into the mask region are either
+          ! treated as binary (100% inside or outside), or partially
+          ! (using the real grid area fractions), depending on the
+          ! HEMCO options.
+          ! ------------------------------------------------------------
+
+          ! Get current time index for this container and at this location
+          tIDx = tIDx_GetIndx( HcoState, ScalDct%Dta, I, J )
+          IF ( tIDx < 1 ) THEN
+             WRITE(*,*) 'Cannot get time slice index at location ',I,J,&
+                          ': ', TRIM(ScalDct%cName), tIDx
+             ERROR = 3
+             EXIT
+          ENDIF
+
+          ! Check if this is a mask. If so, add mask values to the MASK
+          ! array. For now, we assume masks to be binary, i.e. 0 or 1.
+          ! We may want to change that in future to also support values
+          ! in between. This is especially important when regridding
+          ! high resolution masks onto coarser grids!
+          ! ------------------------------------------------------------
+          IF ( ScalDct%DctType == HCO_DCTTYPE_MASK ) THEN
+
+             ! Get mask value
+             CALL GetMaskVal ( ScalDct, I, J, &
+                               TMPVAL,    MaskFractions, RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                ERROR = 4
+                EXIT
+             ENDIF
+
+             ! Pass to output mask
+             MASK(I,J,:) = MASK(I,J,:) * TMPVAL
+
+             ! testing only
+             IF ( HcoState%Config%doVerbose .AND. I==1 .AND. J==1 ) THEN
+                write(MSG,*) 'Mask field ', TRIM(ScalDct%cName),   &
+                     ' found and added to temporary mask.'
+                CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             ENDIF
+
+             ! Advance to next grid box
+             CYCLE
+          ENDIF! DctType=MASK
+
+          ! ------------------------------------------------------------
+          ! For non-mask fields, apply scale factors to all levels
+          ! of the base field individually. If the scale factor
+          ! field has more than one vertical level, use the
+          ! vertical level closest to the corresponding vertical
+          ! level of the base emission field
+          ! ------------------------------------------------------------
+
+          ! Get lower and upper vertical index
+          CALL GetVertIndx( HcoState, BaseDct,       isLevDct1,              &
+                            LevDct1,  LevDct1_Unit,  isLevDct2,              &
+                            LevDct2,  LevDct2_Unit,  I,                      &
+                            J,        LowLL,         UppLL,      RC         )
+          IF ( RC /= HCO_SUCCESS ) THEN
+             ERROR = 1 ! Will cause error
+             EXIT
+          ENDIF
+
+          ! Loop over all vertical levels of the base field
+          DO L = LowLL,UppLL
+             ! If the vertical level exceeds the number of available
+             ! scale factor levels, use the highest available level.
+             IF ( L > ScalLL ) THEN
+                TmpLL = ScalLL
+             ! Otherwise use the same vertical level index.
+             ELSE
+                TmpLL = L
+             ENDIF
+
+             ! Get scale factor for this grid box. Use same uniform
+             ! value if it's a scalar field
+             IF ( ScalDct%Dta%SpaceDim == 1 ) THEN
+                TMPVAL = ScalDct%Dta%V2(tidx)%Val(1,1)
+             ELSEIF ( ScalDct%Dta%SpaceDim == 2 ) THEN
+                TMPVAL = ScalDct%Dta%V2(tidx)%Val(I,J)
+             ELSE
+                TMPVAL = ScalDct%Dta%V3(tidx)%Val(I,J,TmpLL)
+             ENDIF
+
+             !------------------------------------------------------------
+             ! Get scale factor for this grid box. Use same uniform
+             ! value if it's a scalar field.
+             !------------------------------------------------------------
+             tmpVal = Get_Value_From_DataCont( I, J, L, tIdX, ScalDct )
+            
+             ! Eventually apply srcGmaskID to set to scale (mask) to binary
+             ! If there is a srcGMaskID applied to this scale factor, 
+             ! then this scale factor is actually a global mask ...
+             IF ( ScalDct%srcGMaskID > 0 ) THEN
+               ! Set missing mask to 0
+               IF ( tmpVal == HCO_MISSVAL ) tmpVal = 0.0_sp
+               IF ( abs(TMPVAL - ScalDct%srcGMaskID) < 0.01_sp ) THEN
+                 tmpval = 1.0_sp
+               ELSE
+                 tmpval = 0.0_sp
+               ENDIF
+             ELSE
+               ! Set missing value to one
+               IF ( tmpVal == HCO_MISSVAL ) tmpVal = 1.0_sp
+             ENDIF
+
+             ! For negative scale factor, proceed according to the
+             ! negative value setting specified in the configuration
+             ! file (NegFlag = 2: use this value):
+             IF ( TMPVAL < 0.0_sp .AND. HcoState%Options%NegFlag /= 2 ) THEN
+
+                ! NegFlag = 1: ignore and show warning
+                IF ( HcoState%Options%NegFlag == 1 ) THEN
+                   ERROR = -1 ! Will prompt warning
+                   CYCLE
+
+                ! Return w/ error otherwise
+                ELSE
+                   WRITE(*,*) 'Negative scale factor at ',I,J,TmpLL,tidx,&
+                              ': ', TRIM(ScalDct%cName), TMPVAL
+                   ERROR = 1 ! Will cause error
+                   EXIT
+                ENDIF
+             ENDIF
+
+             ! -------------------------------------------------------
+             ! Apply scale factor in accordance to field operator
+             ! -------------------------------------------------------
+
+             ! Oper 1: multiply
+             IF ( ScalDct%Oper == 1 ) THEN
+                OUTARR_3D(I,J,L) = OUTARR_3D(I,J,L) * TMPVAL
+
+             ! Oper -1: divide
+             ELSEIF ( ScalDct%Oper == -1 ) THEN
+                ! Ignore zeros to avoid NaN
+                IF ( TMPVAL /= 0.0_sp ) THEN
+                   OUTARR_3D(I,J,L) = OUTARR_3D(I,J,L) / TMPVAL
+                ENDIF
+
+             ! Oper 2: square
+             ELSEIF ( ScalDct%Oper == 2 ) THEN
+                OUTARR_3D(I,J,L) = OUTARR_3D(I,J,L) * TMPVAL * TMPVAL
+
+             ! Return w/ error otherwise (Oper 3 is only allowed for masks!)
+             ELSE
+                WRITE(*,*) 'Illegal operator for ', TRIM(ScalDct%cName), ScalDct%Oper
+                ERROR = 2 ! Will cause error
+                EXIT
+             ENDIF
+
+          ENDDO !LL
+
+          ! Verbose mode
+          if ( HcoState%Config%doVerbose .and. i == ix .and. j == iy ) then
+             write(MSG,*) 'Scale field ', TRIM(ScalDct%cName)
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             write(MSG,*) 'Time slice: ', tIdx
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             write(MSG,*) 'IX, IY: ', IX, IY
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             write(MSG,*) 'Scale factor (IX,IY,L1): ', TMPVAL
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             write(MSG,*) 'Mathematical operation : ', ScalDct%Oper
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+!             write(lun,*) 'Updt (IX,IY,L1): ', OUTARR_3D(IX,IY,1)
+          endif
+
+       ENDDO !I
+       ENDDO !J
+!$OMP END PARALLEL DO
+
+       ! error check
+       IF ( ERROR > 0 ) THEN
+          IF ( ERROR == 1 ) THEN
+             MSG = 'Negative scale factor found (aborted): ' // TRIM(ScalDct%cName)
+          ELSEIF ( ERROR == 2 ) THEN
+             MSG = 'Illegal mathematical operator for scale factor: ' // TRIM(ScalDct%cName)
+          ELSEIF ( ERROR == 3 ) THEN
+             MSG = 'Encountered negative time index for scale factor: ' // TRIM(ScalDct%cName)
+          ELSEIF ( ERROR == 4 ) THEN
+             MSG = 'Mask error in ' // TRIM(ScalDct%cName)
+          ELSE
+             MSG = 'Error when applying scale factor: ' // TRIM(ScalDct%cName)
+          ENDIF
+          ScalDct => NULL()
+          CALL HCO_ERROR( MSG, RC )
+          RETURN
+       ENDIF
+
+       ! eventually prompt warning for negative values
+       IF ( ERROR == -1 ) THEN
+          MSG = 'Negative scale factor found (ignored): ' // TRIM(ScalDct%cName)
+          IF ( HcoState%Config%doVerbose ) CALL HCO_WARNING( MSG )
+       ENDIF
+
+       ! Free pointer
+       MaskDct => NULL()
+
+    ENDDO ! N
+    ENDIF ! N > 0
+
+    ! Update optional variables
+    IF ( PRESENT(UseLL) ) THEN
+       UseLL = 1
+       IF ( nnLL > 0 ) UseLL = NINT(REAL(TotLL,kind=sp)/REAL(nnLL,kind=sp))
+    ENDIF
+
+    ! Weight output emissions by mask
+    OUTARR_3D = OUTARR_3D * MASK
+
+    ! Cleanup and leave w/ success
+    ScalDct => NULL()
+    CALL HCO_LEAVE ( HcoState%Config%Err, RC )
+
+  END SUBROUTINE Get_Current_Emissions_Adj
+!EOC
+#endif
+!EOC
+END MODULE HCO_Calc_Mod

@@ -1,0 +1,1120 @@
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !MODULE: hco_interp_mod.F90
+!
+! !DESCRIPTION: Module HCO\_INTERP\_MOD contains routines to interpolate
+! input data onto the HEMCO grid. This module contains routine for
+! horizontal regridding between regular grids (MAP\_A2A), as well as
+! vertical interpolation amongst GEOS model levels (full <--> reduced).
+!\\
+!\\
+! Regridding is supported for concentration quantities (default) and
+! index-based values. For the latter, the values in the regridded grid
+! boxes correspond to the value of the original grid that contrbutes most
+! to the given box.
+!\\
+!\\
+! !INTERFACE:
+!
+MODULE HCO_Interp_Mod
+!
+! !USES:
+!
+  USE HCO_Types_Mod
+  USE HCO_Error_Mod
+  USE HCO_State_Mod, ONLY : Hco_State
+
+  IMPLICIT NONE
+  PRIVATE
+!
+! !PUBLIC MEMBER FUNCTIONS:
+!
+  PUBLIC  :: ModelLev_Check
+  PUBLIC  :: ModelLev_Interpolate
+  PUBLIC  :: REGRID_MAPA2A
+!
+! !PRIVATE MEMBER FUNCTIONS:
+!
+  PRIVATE :: COLLAPSE
+!
+! !REVISION HISTORY:
+!  30 Dec 2014 - C. Keller - Initialization
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !PRIVATE VARIABLES:
+!
+  ! AP parameter of native GEOS-5 grid. Needed to remap GEOS-5 data from native
+  ! onto the reduced vertical grid.
+  REAL(hp), TARGET :: G5_EDGE_NATIVE(73) = (/                          &
+              0.000000e+00_hp, 4.804826e-02_hp, 6.593752e+00_hp, 1.313480e+01_hp, &
+              1.961311e+01_hp, 2.609201e+01_hp, 3.257081e+01_hp, 3.898201e+01_hp, &
+              4.533901e+01_hp, 5.169611e+01_hp, 5.805321e+01_hp, 6.436264e+01_hp, &
+              7.062198e+01_hp, 7.883422e+01_hp, 8.909992e+01_hp, 9.936521e+01_hp, &
+              1.091817e+02_hp, 1.189586e+02_hp, 1.286959e+02_hp, 1.429100e+02_hp, &
+              1.562600e+02_hp, 1.696090e+02_hp, 1.816190e+02_hp, 1.930970e+02_hp, &
+              2.032590e+02_hp, 2.121500e+02_hp, 2.187760e+02_hp, 2.238980e+02_hp, &
+              2.243630e+02_hp, 2.168650e+02_hp, 2.011920e+02_hp, 1.769300e+02_hp, &
+              1.503930e+02_hp, 1.278370e+02_hp, 1.086630e+02_hp, 9.236572e+01_hp, &
+              7.851231e+01_hp, 6.660341e+01_hp, 5.638791e+01_hp, 4.764391e+01_hp, &
+              4.017541e+01_hp, 3.381001e+01_hp, 2.836781e+01_hp, 2.373041e+01_hp, &
+              1.979160e+01_hp, 1.645710e+01_hp, 1.364340e+01_hp, 1.127690e+01_hp, &
+              9.292942e+00_hp, 7.619842e+00_hp, 6.216801e+00_hp, 5.046801e+00_hp, &
+              4.076571e+00_hp, 3.276431e+00_hp, 2.620211e+00_hp, 2.084970e+00_hp, &
+              1.650790e+00_hp, 1.300510e+00_hp, 1.019440e+00_hp, 7.951341e-01_hp, &
+              6.167791e-01_hp, 4.758061e-01_hp, 3.650411e-01_hp, 2.785261e-01_hp, &
+              2.113490e-01_hp, 1.594950e-01_hp, 1.197030e-01_hp, 8.934502e-02_hp, &
+              6.600001e-02_hp, 4.758501e-02_hp, 3.270000e-02_hp, 2.000000e-02_hp, &
+              1.000000e-02_hp /)
+
+  ! AP parameter of native 102-layer GISS grid
+  REAL(hp), TARGET :: E102_EDGE_NATIVE(103) = (/                                            &
+                0.0000000,   2.7871507,   5.5743014,   8.3614521,  11.1486028, 13.9357536,  &
+               16.7229043,  19.5100550,  22.2972057,  25.0843564,  27.8715071, 30.6586578,  &
+               33.4458085,  36.2329593,  39.0201100,  41.8087123,  44.6089278, 47.4534183,  &
+               50.4082336,  53.5662786,  57.0095710,  60.7533531,  64.7323011, 68.8549615,  &
+               73.0567364,  77.2969797,  81.5364973,  85.7346430,  89.8565776, 93.8754457,  &
+               97.7709243, 101.5277712, 105.1350991, 108.5878272, 111.8859556, 115.0302100, &
+              118.0249453, 120.8854039, 123.6326345, 126.2811535, 128.8360417, 131.2987506, &
+              133.6736353, 135.9708571, 138.2013035, 140.3700552, 142.4814670, 144.5457005, &
+              146.5692881, 148.5464231, 150.4712991, 152.3497225, 154.1875000, 144.5468750, &
+              135.1875000, 126.0781250, 117.1914062, 108.5859375, 100.3671875, 92.5898438,  &
+               85.2265625,  78.2226562,  71.5546875,  65.2226562,  59.2226562, 53.5546875,  &
+               48.2226562,  43.2226562,  38.5546875,  34.2226562,  30.2226562, 26.5507812,  &
+               23.1875000,  20.0781250,  17.1896562,  14.5684375,  12.2865742, 10.3573086,  &
+                8.7353750,   7.3664922,   6.2100156,   5.2343633,   4.4119297, 3.7186797,   &
+                3.1341479,   2.6404328,   2.2207877,   1.8587369,   1.5477125, 1.2782115,   &
+                1.0427319,   0.8367716,   0.6514691,   0.4772511,   0.3168814, 0.1785988,   &
+                0.1000000,   0.0560000,   0.0320000,   0.0180000,   0.0100000, 0.0050000,   &
+                0.0020000 /)
+
+CONTAINS
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Regrid_MAPA2A
+!
+! !DESCRIPTION: Subroutine Regrid\_MAPA2A regrids input array NcArr onto
+! the simulation grid and stores the data in list container Lct. Horizontal
+! regridding is performed using MAP\_A2A algorithm. Vertical interpolation
+! between GEOS levels (full vs. reduced, GEOS-5 vs. GEOS-4), is also
+! supported.
+!\\
+!\\
+! This routine can remap concentrations and index-based quantities.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE REGRID_MAPA2A( HcoState, NcArr, LonE, LatE, Lct, RC )
+!
+! !USES:
+!
+    USE HCO_REGRID_A2A_Mod, ONLY : MAP_A2A
+    USE HCO_FileData_Mod,   ONLY : FileData_ArrCheck
+    USE HCO_UNIT_MOD,       ONLY : HCO_IsIndexData
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State),  POINTER        :: HcoState          ! HEMCO state object
+    REAL(sp),         POINTER        :: NcArr(:,:,:,:)    ! 4D input data
+    REAL(hp),         POINTER        :: LonE(:)           ! Input grid longitude edges
+    REAL(hp),         POINTER        :: LatE(:)           ! Input grid latitude edges
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(ListCont),   POINTER        :: Lct               ! HEMCO list container
+    INTEGER,          INTENT(INOUT)  :: RC                ! Success or failure?
+!
+! !REVISION HISTORY:
+!  03 Feb 2015 - C. Keller   - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER                 :: nLonEdge, nLatEdge
+    INTEGER                 :: NX, NY, NZ, NLEV, NTIME, NCELLS
+    INTEGER                 :: I, J, L, T, AS, I2
+    INTEGER                 :: nIndex
+    REAL(sp), ALLOCATABLE   :: LonEdgeI(:)
+    REAL(sp), ALLOCATABLE   :: LatEdgeI(:)
+    REAL(sp)                :: LonEdgeO(HcoState%NX+1)
+    REAL(sp)                :: LatEdgeO(HcoState%NY+1)
+
+    REAL(sp), POINTER       :: ORIG_2D(:,:)
+    REAL(sp), POINTER       :: REGR_2D(:,:)
+    REAL(sp), POINTER       :: REGR_4D(:,:,:,:)
+
+    REAL(sp), ALLOCATABLE, TARGET :: FRACS(:,:,:,:)
+    REAL(hp), ALLOCATABLE         :: REGFRACS(:,:,:,:)
+    REAL(hp), ALLOCATABLE         :: MAXFRACS(:,:,:,:)
+    REAL(hp), ALLOCATABLE         :: INDECES(:,:,:,:)
+    REAL(hp), ALLOCATABLE         :: UNIQVALS(:)
+    REAL(hp)                      :: IVAL
+    LOGICAL                       :: IsIndex
+
+    LOGICAL                 :: VERB
+    CHARACTER(LEN=255)      :: MSG
+    CHARACTER(LEN=255)      :: LOC = 'ModelLev_Interpolate (hco_interp_mod.F90)'
+
+    !=================================================================
+    ! REGRID_MAPA2A begins here
+    !=================================================================
+
+    ! Init
+    ORIG_2D => NULL()
+    REGR_2D => NULL()
+    REGR_4D => NULL()
+
+    ! Check for verbose mode
+    verb = HcoState%Config%doVerbose
+
+    ! get longitude / latitude sizes
+    nLonEdge = SIZE(LonE,1)
+    nLatEdge = SIZE(LatE,1)
+
+    ! Write input grid edges to shadow variables so that map_a2a accepts them
+    ! as argument.
+    ! Also, for map_a2a, latitudes have to be sines...
+    ALLOCATE(LonEdgeI(nlonEdge), LatEdgeI(nlatEdge), STAT=AS )
+    IF ( AS /= 0 ) THEN
+       CALL HCO_ERROR( 'alloc error LonEdgeI/LatEdgeI', RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+    LonEdgeI(:) = LonE
+    LatEdgeI(:) = SIN( LatE * HcoState%Phys%PI_180 )
+
+    ! Get output grid edges from HEMCO state
+    LonEdgeO(:) = HcoState%Grid%XEDGE%Val(:,1)
+    LatEdgeO(:) = HcoState%Grid%YSIN%Val(1,:)
+
+    ! Get input array sizes
+    NX     = size(ncArr,1)
+    NY     = size(ncArr,2)
+    NLEV   = size(ncArr,3)
+    NTIME  = size(ncArr,4)
+    NCELLS = NX * NY * NLEV * NTIME
+
+    ! Are these index-based data? If so, need to remap the fraction (1 or 0)
+    ! of every value independently. For every grid box, the value with the
+    ! highest overlap (closest to 1) is taken.
+    IsIndex = HCO_IsIndexData(Lct%Dct%Dta%OrigUnit)
+
+    IF ( IsIndex ) THEN
+
+       ! Allocate working arrays:
+       ! - FRACS contains the fractions on the original grid. These are
+       !   binary (1 or 0).
+       ! - MAXFRACS stores the highest used fraction for each output grid
+       !   box. Will be updated continously.
+       ! - INDECES is the output array holding the index-based remapped
+       !   values. Will be updated continuously.
+       ! - UNIQVALS is a vector holding all unique values of the input
+       !   array (NINDEX is the number of unique values).
+       !
+       ! ckeller, 9/24/15: Extend vertical axis of MAXFRACS, REGFRACS, and
+       ! INDECES to HcoState%NZ+1 for fields that are on edges instead of
+       ! mid-points.
+       ALLOCATE( FRACS(NX,NY,NLEV,NTIME), STAT=AS )
+       IF ( AS /= 0 ) THEN
+          CALL HCO_ERROR( 'alloc error FRACS', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       ALLOCATE( MAXFRACS(HcoState%NX,HcoState%NY,HcoState%NZ+1,NTIME), STAT=AS )
+       IF ( AS /= 0 ) THEN
+          CALL HCO_ERROR( 'alloc error MAXFRACS', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       ALLOCATE( REGFRACS(HcoState%NX,HcoState%NY,HcoState%NZ+1,NTIME), STAT=AS )
+       IF ( AS /= 0 ) THEN
+          CALL HCO_ERROR( 'alloc error INDECES', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       ALLOCATE( INDECES(HcoState%NX,HcoState%NY,HcoState%NZ+1,NTIME), STAT=AS )
+       IF ( AS /= 0 ) THEN
+          CALL HCO_ERROR( 'alloc error INDECES', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       ALLOCATE( UNIQVALS(NCELLS), STAT=AS )
+       IF ( AS /= 0 ) THEN
+          CALL HCO_ERROR( 'alloc error INDECES', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       FRACS    = 0.0_sp
+       REGFRACS = 0.0_hp
+       MAXFRACS = 0.0_hp
+       INDECES  = 0.0_hp
+       UNIQVALS = 0.0_hp
+
+       ! Get unique values. Loop over all input data values and add
+       ! them to UNIQVALS vector if UNIQVALS doesn't hold that same value
+       ! yet.
+       NINDEX = 0
+       DO T = 1, NTIME
+       DO L = 1, NLEV
+       DO J = 1, NY
+       DO I = 1, NX
+
+          ! Current value
+          IVAL = NcArr(I,J,L,T)
+
+          ! Check if value already exists in UNIQVALS
+          IF ( NINDEX > 0 ) THEN
+             IF ( ANY(UNIQVALS(1:NINDEX) == IVAL) ) CYCLE
+          ENDIF
+
+          ! Add to UNIQVALS
+          NINDEX = NINDEX + 1
+          UNIQVALS(NINDEX) = IVAL
+       ENDDO
+       ENDDO
+       ENDDO
+       ENDDO
+
+       ! Verbose mode
+       IF ( verb ) THEN
+          MSG = 'Do index based regridding for field ' // TRIM(Lct%Dct%cName)
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          WRITE(MSG,*) '   - Number of indeces: ', NINDEX
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+    ELSE
+       NINDEX = 1
+    ENDIF
+
+    ! Define array to put horizontally regridded data onto. If this
+    ! is 3D data, we first regrid all vertical levels horizontally
+    ! and then pass these data to the list container. In this second
+    ! step, levels may be deflated/collapsed.
+
+    ! 2D data is directly passed to the data container
+    IF ( Lct%Dct%Dta%SpaceDim <= 2 ) THEN
+       CALL FileData_ArrCheck( HcoState%Config, Lct%Dct%Dta, &
+                               HcoState%NX, HcoState%NY, NTIME, RC )
+       IF ( RC /= 0 ) RETURN
+    ENDIF
+
+    ! 3D data and index data is first written into a temporary array,
+    ! REGR_4D.
+    IF ( Lct%Dct%Dta%SpaceDim == 3 .OR. IsIndex ) THEN
+       ALLOCATE( REGR_4D(HcoState%NX,HcoState%NY,NLEV,NTIME), STAT=AS )
+       IF ( AS /= 0 ) THEN
+          CALL HCO_ERROR( 'alloc error REGR_4D', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       REGR_4D = 0.0_hp
+    ENDIF
+
+    ! Do regridding for every index value. If it's not index data, this loop
+    ! is executed only once (NINDEX=1).
+    DO I = 1, NINDEX
+
+       ! For index based data, create fractions array for the given index.
+       IF ( IsIndex ) THEN
+          IVAL = UNIQVALS(I)
+          WHERE( ncArr == IVAL )
+             FRACS = 1.0_sp
+          ELSEWHERE
+             FRACS = 0.0_sp
+          END WHERE
+       ENDIF
+
+       ! Regrid horizontally
+       DO T = 1, NTIME
+       DO L = 1, NLEV
+
+          ! Point to 2D slices to be regridded:
+          ! - Original 2D array
+          IF ( IsIndex ) THEN
+            ORIG_2D => FRACS(:,:,L,T)
+          ELSE
+            ORIG_2D => ncArr(:,:,L,T)
+          ENDIF
+
+          ! - Regridded 2D array
+          IF ( Lct%Dct%Dta%SpaceDim <= 2 .AND. .NOT. IsIndex ) THEN
+             REGR_2D => Lct%Dct%Dta%V2(T)%Val(:,:)
+          ELSE
+             REGR_2D => REGR_4D(:,:,L,T)
+          ENDIF
+
+          ! Do the regridding
+          CALL MAP_A2A( NX,      NY, LonEdgeI,    LatEdgeI, ORIG_2D,  &
+                        HcoState%NX, HcoState%NY, LonEdgeO, LatEdgeO, &
+                        REGR_2D, 0, 0, HCO_MISSVAL )
+          ORIG_2D => NULL()
+          REGR_2D => NULL()
+
+       ENDDO !L
+       ENDDO !T
+
+       ! Eventually collapse levels onto simulation levels.
+       IF ( Lct%Dct%Dta%SpaceDim == 3 ) THEN
+          CALL ModelLev_Interpolate( HcoState, REGR_4D, Lct, RC )
+          IF ( RC /= HCO_SUCCESS ) THEN
+              CALL HCO_ERROR( 'ERROR 0', RC, THISLOC=LOC )
+              RETURN
+          ENDIF
+       ENDIF
+
+       ! For index based data, map fractions back to corresponding value.
+       ! Array INDECES holds the index-based remapped values. Set INDECES
+       ! to current index value in every grid box where the regridded
+       ! fraction of this index is higher than any previous fraction
+       ! (array MAXFRACS stores the highest used fraction in each grid box).
+       IF ( IsIndex ) THEN
+
+          ! Reset
+          REGFRACS = 0.0_hp
+
+          ! 3D data written to Lct needs to be mapped back onto REGR_4D.
+          IF ( Lct%Dct%Dta%SpaceDim == 3 ) THEN
+             DO T = 1, NTIME
+                NZ = SIZE(Lct%Dct%Dta%V3(T)%Val,3)
+                REGFRACS(:,:,1:NZ,T) = Lct%Dct%Dta%V3(T)%Val(:,:,:)
+             ENDDO
+          ELSE
+             REGFRACS(:,:,1:NLEV,:) = REGR_4D(:,:,:,:)
+          ENDIF
+
+          ! REGR_4D are the remapped fractions.
+          DO T  = 1, NTIME
+          DO L  = 1, HcoState%NZ
+          DO J  = 1, HcoState%NY
+          DO I2 = 1, HcoState%NX
+             IF ( REGFRACS(I2,J,L,T) > MAXFRACS(I2,J,L,T) ) THEN
+                MAXFRACS(I2,J,L,T) = REGR_4D(I2,J,L,T)
+                INDECES (I2,J,L,T) = IVAL
+             ENDIF
+          ENDDO
+          ENDDO
+          ENDDO
+          ENDDO
+
+!------------------------------------------------------------------------------
+! Prior to 9/29/16:
+!          ! This code is preblematic in Gfortran.  Replace it with the
+!          ! explicit DO loops above.  Leave this here for reference.
+!          ! (sde, bmy, 9/21/16)
+!          WHERE ( REGFRACS > MAXFRACS )
+!             MAXFRACS = REGR_4D
+!             INDECES  = IVAL
+!          END WHERE
+!------------------------------------------------------------------------------
+       ENDIF
+
+    ENDDO !I
+
+    ! For index values, pass index data to data container.
+    IF ( IsIndex ) THEN
+       IF ( Lct%Dct%Dta%SpaceDim == 3 ) THEN
+          DO T = 1, NTIME
+             NZ = SIZE(Lct%Dct%Dta%V3(T)%Val,3)
+             Lct%Dct%Dta%V3(T)%Val(:,:,:) = INDECES(:,:,1:NZ,T)
+          ENDDO
+       ELSE
+          DO T = 1, NTIME
+             Lct%Dct%Dta%V2(T)%Val(:,:)   = INDECES(:,:,1,T)
+          ENDDO
+       ENDIF
+    ENDIF
+
+    ! Cleanup
+    DEALLOCATE(LonEdgeI, LatEdgeI)
+    IF ( ASSOCIATED( REGR_4D  ) ) DEALLOCATE( REGR_4D  )
+    IF ( ALLOCATED ( FRACS    ) ) DEALLOCATE( FRACS    )
+    IF ( ALLOCATED ( REGFRACS ) ) DEALLOCATE( REGFRACS )
+    IF ( ALLOCATED ( MAXFRACS ) ) DEALLOCATE( MAXFRACS )
+    IF ( ALLOCATED ( INDECES  ) ) DEALLOCATE( INDECES  )
+    IF ( ALLOCATED ( UNIQVALS ) ) DEALLOCATE( UNIQVALS )
+
+    ! Return w/ success
+    RC = HCO_SUCCESS
+
+  END SUBROUTINE REGRID_MAPA2A
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: ModelLev_Check
+!
+! !DESCRIPTION: Subroutine ModelLev\_Check checks if the passed number of
+! vertical levels indicates that these are model levels or not.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE ModelLev_Check( HcoState, nLev, IsModelLev, RC )
+!
+! !USES:
+!
+    USE HCO_FileData_Mod,   ONLY : FileData_ArrCheck
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State),  POINTER        :: HcoState          ! HEMCO state object
+    INTEGER,          INTENT(IN   )  :: nlev              ! number of levels
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    LOGICAL,          INTENT(INOUT)  :: IsModelLev        ! Are these model levels?
+    INTEGER,          INTENT(INOUT)  :: RC                ! Success or failure?
+!
+! !REVISION HISTORY:
+!  29 Sep 2015 - C. Keller   - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER                 :: nz
+
+    !=================================================================
+    ! ModelLev_Check begins here
+    !=================================================================
+
+    ! Assume success until otherwise
+    RC = HCO_SUCCESS
+
+    ! Shadow number of vertical levels on grid
+    nz = HcoState%NZ
+
+    ! Assume model levels if input data levels correspond to # of grid
+    ! levels or levels + 1 (edges)
+    IF ( nlev == nz .OR. nlev == nz + 1 ) THEN
+       IsModelLev = .TRUE.
+
+   ! If input is 72 layer (or 3/11/36 layer) and output is 47 layer
+    ELSEIF ( nz == 47 ) THEN
+       IsModelLev = ( nlev == 72 .OR. nlev == 73 .OR. nlev == 36 .OR. nlev == 3 .OR. nlev == 11)
+
+    ! If input is 102 layer and output is 74 layer
+    ELSEIF ( nz == 74 ) THEN
+       IsModelLev = ( nlev == 102 .OR. nlev == 103 )
+
+    ! If input is 47 layer (or 3/11/36 layer) and output is 72 layer
+    ELSEIF ( nz == 72 ) THEN
+       IsModelLev = ( nlev == 47 .OR. nlev == 48 .OR. nlev == 36 .OR. nlev == 3 .OR. nlev == 11)
+
+    ELSE
+      IsModelLev = .FALSE.
+    ENDIF
+
+  END SUBROUTINE ModelLev_Check
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: ModelLev_Interpolate
+!
+! !DESCRIPTION: Subroutine ModelLev\_Interpolate puts 3D data from an
+! arbitrary number of model levels onto the vertical levels of the simulation
+! grid. Since the input data is already on model levels, this is only to
+! collapse fields between native/reduced vertical levels, e.g. from
+! 72 native GEOS-5 levels onto the reduced 47 levels.
+!
+!
+! The input data (REGR\_4D) is expected to be already regridded horizontally.
+! The 4th dimension of REGR\_4D denotes time.
+!
+!
+! The 3rd dimension of REGR\_3D holds the vertical levels. It is assumed that
+! these are model levels, starting at the surface (level 1). If the input
+! data holds 72/73 input levels, this is interpreted as native data and will
+! be collapsed onto the reduced GEOS-5 grid. If the input holds 102/103 input
+! levels, this is interpreted as native data and will be collapsed onto the 
+! reduced GISS grid. If the input holds 47/48 input levels, this is interpreted
+! as reduced GEOS-5 data and it will be inflated to the native GEOS-5 grid
+! (with a warning, as this is not recommended). If the input holds N input levels,
+! (where N = 3, 11, or 36 to account for NEI and AEIC emissions), this is assumed 
+! to be the first N levels of the GEOS-5 grid, meaning they will be written as 
+! levels 1-N of a 47 or 72 level output grid (with the remaining values left to
+! be zero) (nbalasus, 8/29/2023).
+!
+!
+! Currently, this routine can remap the following combinations:
+!
+! * Native GEOS-5 onto reduced GEOS-5 (72 --> 47 levels, 73 --> 48 edges)
+! * Native GISS onto reduced GISS (102 --> 74 levels, 103 --> 75 edges) 
+! * Reduced GEOS-5 onto native GEOS-5 (47 --> 72 levels, 48 --> 73 edges)
+! * N (N = 3/11/36) levels onto native/reduced GEOS-5 (N --> levels 1-N levels of 47/72 level grid, rest are 0)
+!
+! !INTERFACE:
+!
+  SUBROUTINE ModelLev_Interpolate( HcoState, REGR_4D, Lct, RC )
+!
+! !USES:
+!
+    USE HCO_FileData_Mod,   ONLY : FileData_ArrCheck
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State),  POINTER        :: HcoState          ! HEMCO state object
+    REAL(sp),         POINTER        :: REGR_4D(:,:,:,:)  ! 4D input data
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(ListCont),   POINTER        :: Lct               ! HEMCO list container
+    INTEGER,          INTENT(INOUT)  :: RC                ! Success or failure?
+!
+! !REVISION HISTORY:
+!  30 Dec 2014 - C. Keller   - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER                 :: nx, ny, nz, nt
+    INTEGER                 :: fineIDX, coarseIDX
+    INTEGER                 :: minlev, nlev, nout
+    INTEGER                 :: L, T, NL, I
+    INTEGER                 :: OS
+    LOGICAL                 :: verb, infl, clps
+    LOGICAL                 :: DONE, do_sum
+    CHARACTER(LEN=255)      :: MSG, LOC
+
+    !=================================================================
+    ! ModelLev_Interpolate begins here
+    !=================================================================
+    LOC = 'ModelLev_Interpolate (HCO_INTERP_MOD.F90)'
+
+    ! Enter
+    CALL HCO_ENTER (HcoState%Config%Err, LOC, RC )
+    IF ( RC /= HCO_SUCCESS ) THEN
+        CALL HCO_ERROR( 'ERROR 1', RC, THISLOC=LOC )
+        RETURN
+    ENDIF
+
+    ! Check for verbose mode
+    verb = HcoState%Config%doVerbose
+    IF ( verb ) THEN
+       MSG = 'Vertically interpolate model levels: '//TRIM(Lct%Dct%cName)
+       CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+    ENDIF
+
+    ! Get HEMCO grid dimensions
+    nx = HcoState%NX
+    ny = HcoState%NY
+    nz = HcoState%NZ
+
+    ! Input data must be on horizontal HEMCO grid
+    IF ( SIZE(REGR_4D,1) /= nx ) THEN
+       WRITE(MSG,*) 'x dimension mismatch ', TRIM(Lct%Dct%cName), &
+          ': ', nx, SIZE(REGR_4D,1)
+       CALL HCO_ERROR( MSG, RC )
+       RETURN
+    ENDIF
+    IF ( SIZE(REGR_4D,2) /= ny ) THEN
+       WRITE(MSG,*) 'y dimension mismatch ', TRIM(Lct%Dct%cName), &
+          ': ', ny, SIZE(REGR_4D,2)
+       CALL HCO_ERROR( MSG, RC )
+       RETURN
+    ENDIF
+
+    ! Get vertical and time dimension of input data
+    nlev = SIZE(REGR_4D,3)
+    nt   = SIZE(REGR_4D,4)
+
+    ! Check to make sure ModelLev_Interpolate should have been called
+    IF ( ( ( nlev == nz ) .OR. ( nlev == nz+1 ) ) .OR. &                          ! write data without doing anything
+         ( ( nz == 47 ) .AND. ( ( nlev == 72 ) .OR. ( nlev == 73 ) ) ) .OR. &     ! collapse native to reduced GEOS-5
+         ( ( nz == 74 ) .AND. ( ( nlev == 102 ) .OR. ( nlev == 103 ) ) ) .OR. &   ! collapse native to reduced GISS
+         ( ( nz == 72 ) .AND. ( ( nlev == 47 ) .OR. ( nlev == 48 ) ) ) .OR. &     ! inflate reduced to native GEOS-5
+         ( ( ( nz == 72 ) .OR. ( nz == 47 ) ) .AND. ( ( nlev == 3 ) .OR. ( nlev == 11 ) .OR. ( nlev == 36 ) ) ) ) THEN  ! write 3/11/36 levels to reduced/native GEOS-5
+         ! do nothing
+    ELSE
+      WRITE(MSG,*) 'ModelLev_Interpolate was called but MESSy should have been used: ',TRIM(Lct%Dct%cName)
+      CALL HCO_ERROR( MSG, RC )
+      RETURN
+    ENDIF
+
+    ! Vertical interpolation done?
+    DONE = .FALSE.
+
+    !===================================================================
+    ! If no vertical interpolation is needed, then (1) save the 4D
+    ! input data array to to the HEMCO list container object and
+    ! (2) exit this subroutine.
+    !===================================================================
+    IF ( ( nlev == nz ) .OR. ( nlev == nz+1 ) ) THEN
+
+       CALL FileData_ArrCheck( HcoState%Config, Lct%Dct%Dta, nx, ny, nlev, nt, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+           CALL HCO_ERROR( 'ERROR 2', RC, THISLOC=LOC )
+           RETURN
+       ENDIF
+
+       DO T = 1, nt
+          Lct%Dct%Dta%V3(T)%Val(:,:,:) = REGR_4D(:,:,:,T)
+       ENDDO
+
+       ! Verbose
+       IF ( HcoState%Config%doVerbose ) THEN
+          MSG = '# of input levels = # of output levels - passed as is.'
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+       ! Done!
+       DONE = .TRUE.
+    ENDIF
+
+    !===================================================================
+    ! Do vertical regridding:
+    !===================================================================
+    IF ( .NOT. DONE ) THEN
+
+       !----------------------------------------------------------------
+       ! Determine if the variable (e.g. Met_DELPDRY) needs
+       ! to be summed in the vertical instead of averaged.
+       !----------------------------------------------------------------
+       do_sum = ( INDEX( TRIM( Lct%Dct%cName ), "DELPDRY" ) > 0 )
+
+       !----------------------------------------------------------------
+       ! Native to reduced GEOS-5 levels
+       !----------------------------------------------------------------
+       IF ( nz == 47 ) THEN
+
+          ! Determine if the variable is on model levels or edges
+          IF ( nlev == 72 ) THEN
+             NL   = 36
+             nout = 47
+          ELSEIF ( nlev == 73 ) THEN
+             NL   = 37
+             nout = 48
+          ELSEIF ( nlev == 3 ) THEN
+             NL   = 3
+             nout = 47
+          ELSEIF ( nlev == 11 ) THEN
+             NL   = 11
+             nout = 47
+          ELSEIF ( nlev == 36 ) THEN
+             NL   = 36
+             nout = 47
+          ELSE
+             MSG = 'Can only remap from native onto reduced GEOS-5 if '// &
+                   'input data has exactly 72, 73, 3, 11, or 36 levels: '//TRIM(Lct%Dct%cName)
+             CALL HCO_ERROR( MSG, RC )
+             RETURN
+          ENDIF ! nlev == (72,73,3,11,36ELSE)
+
+          ! Make sure output array is allocated
+          CALL FileData_ArrCheck( HcoState%Config, Lct%Dct%Dta, nx, ny, nout, nt, RC )
+
+          ! Do for every time slice
+          DO T = 1, nt
+
+             ! Levels that are passed level-by-level.
+             DO L = 1, NL
+                Lct%Dct%Dta%V3(T)%Val(:,:,L) = REGR_4D(:,:,L,T)
+             ENDDO !L
+
+            ! If remapping model grid layers, collapse layers 
+             IF ( nlev == 72 ) THEN
+               ! Collapse two levels (e.g. levels 37-38 into level 37):
+               CALL COLLAPSE( Lct, REGR_4D, 37, 37, 2, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 38, 39, 2, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 39, 41, 2, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 40, 43, 2, T, 5, do_sum, RC )
+               ! Collapse four levels:
+               CALL COLLAPSE( Lct, REGR_4D, 41, 45, 4, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 42, 49, 4, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 43, 53, 4, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 44, 57, 4, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 45, 61, 4, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 46, 65, 4, T, 5, do_sum, RC )
+               CALL COLLAPSE( Lct, REGR_4D, 47, 69, 4, T, 5, do_sum, RC )
+             ! If remapping model grid edges, sample at edges
+             ELSEIF ( nlev == 73 ) THEN
+               Lct%Dct%Dta%V3(T)%Val(:,:,38) = REGR_4D(:,:,39,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,39) = REGR_4D(:,:,41,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,40) = REGR_4D(:,:,43,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,41) = REGR_4D(:,:,45,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,42) = REGR_4D(:,:,49,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,43) = REGR_4D(:,:,53,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,44) = REGR_4D(:,:,57,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,45) = REGR_4D(:,:,61,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,46) = REGR_4D(:,:,65,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,47) = REGR_4D(:,:,69,T)
+               Lct%Dct%Dta%V3(T)%Val(:,:,48) = REGR_4D(:,:,73,T)
+            ! If the input is N (N = 3/11/36) levels, levels N+1 to 47 are set to 0
+             ELSEIF ( nlev == 3 ) THEN
+               DO L = 4,47
+                  Lct%Dct%Dta%V3(T)%Val(:,:,L) = 0.0_hp
+               ENDDO !L
+             ELSEIF ( nlev == 11 ) THEN
+               DO L = 12,47
+                  Lct%Dct%Dta%V3(T)%Val(:,:,L) = 0.0_hp
+               ENDDO !L
+             ELSEIF ( nlev == 36 ) THEN
+               DO L = 37,47
+                  Lct%Dct%Dta%V3(T)%Val(:,:,L) = 0.0_hp
+               ENDDO !L
+             ENDIF ! nlev == (72,73,36)
+
+          ENDDO ! T
+
+          ! Verbose
+          IF ( HcoState%Config%doVerbose ) THEN
+             WRITE(MSG,*) 'Mapped ', nlev, ' levels onto reduced GEOS-5 levels.'
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             IF ( nlev == 3 .OR. nlev == 11 .OR. nlev == 36 ) THEN
+               WRITE(MSG,*) 'The input variable has ', nlev, 'L, which were written to be L 1-', nlev, ' on the output 47 L grid (remaining values set to 0).'
+             ELSE
+               WRITE(MSG,*) 'Pressure-weighted vertical regridding was done - consider if this is appropriate for the variable units.'
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             ENDIF
+          ENDIF
+
+          ! Done!
+          DONE = .TRUE.
+
+       !----------------------------------------------------------------
+       ! Native to reduced GISS levels
+       !----------------------------------------------------------------
+       ELSEIF ( nz == 74 ) THEN
+
+          ! Determine if the variable is on model levels or edges
+          IF ( nlev == 102 ) THEN
+             NL   = 60
+             nout = 74
+          ELSEIF ( nlev == 103 ) THEN
+             NL   = 61
+             nout = 75
+          ELSE
+             MSG = 'Can only remap from native onto reduced GISS if '// &
+                   'input data has exactly 102 or 103 levels: '//TRIM(Lct%Dct%cName)
+             CALL HCO_ERROR( MSG, RC )
+             RETURN
+          ENDIF ! nlev == (102,103,ELSE)
+
+          ! Make sure output array is allocated
+          CALL FileData_ArrCheck( HcoState%Config, Lct%Dct%Dta, nx, ny, nout, nt, RC )
+
+          ! Do for every time slice
+          DO T = 1, nt
+
+             ! Levels that are passed level-by-level.
+             DO L = 1, NL
+                Lct%Dct%Dta%V3(T)%Val(:,:,L) = REGR_4D(:,:,L,T)
+             ENDDO !L
+
+             ! If remapping model grid layers, collapse layers
+             IF ( nlev == 102 ) THEN
+                ! Collapse two levels (e.g. levels 61-62 into level 61):
+                CALL COLLAPSE( Lct, REGR_4D, 61, 61, 2, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 62, 63, 2, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 63, 65, 2, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 64, 67, 2, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 65, 69, 2, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 66, 71, 2, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 67, 73, 2, T, 22, do_sum, RC )
+                ! Collapse four levels:
+                CALL COLLAPSE( Lct, REGR_4D, 68, 75, 4, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 69, 79, 4, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 70, 83, 4, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 71, 87, 4, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 72, 91, 4, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 73, 95, 4, T, 22, do_sum, RC )
+                CALL COLLAPSE( Lct, REGR_4D, 74, 99, 4, T, 22, do_sum, RC )
+             ! If remapping model grid edges, sample at the edges
+             ELSE
+                Lct%Dct%Dta%V3(T)%Val(:,:,62) = REGR_4D(:,:,63,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,63) = REGR_4D(:,:,65,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,64) = REGR_4D(:,:,67,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,65) = REGR_4D(:,:,69,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,66) = REGR_4D(:,:,71,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,67) = REGR_4D(:,:,73,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,68) = REGR_4D(:,:,75,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,69) = REGR_4D(:,:,79,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,70) = REGR_4D(:,:,83,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,71) = REGR_4D(:,:,87,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,72) = REGR_4D(:,:,91,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,73) = REGR_4D(:,:,95,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,74) = REGR_4D(:,:,99,T)
+                Lct%Dct%Dta%V3(T)%Val(:,:,75) = REGR_4D(:,:,103,T)
+             ENDIF ! nlev == (102,ELSE)
+          ENDDO ! T
+
+          ! Verbose
+          IF ( HcoState%Config%doVerbose ) THEN
+             WRITE(MSG,*) 'Mapped ', nlev, ' levels onto reduced GISS levels.'
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             WRITE(MSG,*) 'Pressure-weighted vertical regridding was done - consider if this is appropriate for the variable units.'
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          ENDIF
+
+          ! Done!
+          DONE = .TRUE.
+
+       !----------------------------------------------------------------
+       ! Reduced to native GEOS-5 levels
+       !----------------------------------------------------------------
+       ELSEIF ( nz == 72 ) THEN
+
+          ! Determine if the variable is on model levels or edges
+          IF ( nlev == 47 ) THEN
+             NL   = 36
+             nout = 72
+          ELSEIF ( nlev == 48 ) THEN
+             NL   = 37
+             nout = 73
+          ELSEIF ( nlev == 3 ) THEN
+             NL   = 3
+             nout = 72
+          ELSEIF ( nlev == 11 ) THEN
+             NL   = 11
+             nout = 72
+          ELSEIF ( nlev == 36 ) THEN
+             NL   = 36
+             nout = 72
+          ELSE
+             MSG = 'Can only remap from reduced onto native GEOS-5 if '// &
+                   'input data has exactly 47, 48, 3, 11, or 36 levels: '//TRIM(Lct%Dct%cName)
+             CALL HCO_ERROR( MSG, RC )
+             RETURN
+          ENDIF ! nlev == (48,48,3,11,36,ELSE)
+
+          ! Make sure output array is allocated
+          CALL FileData_ArrCheck( HcoState%Config, Lct%Dct%Dta, nx, ny, nout, nt, RC )
+
+          ! Do for every time slice
+          DO T = 1, nt
+
+             ! Levels that are passed level-by-level.
+             DO L = 1, NL
+                Lct%Dct%Dta%V3(T)%Val(:,:,L) = REGR_4D(:,:,L,T)
+             ENDDO !L
+
+             ! If remapping model grid layers, inflate layers
+             IF ( nlev == 47 ) THEN
+
+                ! Inflate two levels (e.g. levels 37-38 on the fine grid are copies of level 37 on the coarse grid):
+                coarseIDX = 36
+                DO I = 1,8
+                   fineIDX = 36 + I
+                   IF ( MOD(I,2) /= 0 ) THEN
+                     coarseIDX = coarseIDX + 1
+                   ENDIF
+                   Lct%Dct%Dta%V3(T)%Val(:,:,fineIDX) = REGR_4D(:,:,coarseIDX,T)
+                ENDDO ! I
+
+                ! Inflate four levels (e.g. levels 45-48 on the fine grid are copies of level 41 on the coarse grid)
+                coarseIDX = 40
+                DO I = 1,28
+                   fineIDX = 44 + i
+                   IF ( MOD(I-1,4) == 0 ) THEN
+                      coarseIDX = coarseIDX + 1
+                   ENDIF
+                   Lct%Dct%Dta%V3(T)%Val(:,:,fineIDX) = REGR_4D(:,:,coarseIDX,T)
+                ENDDO ! I
+
+             ! If remapping model grid edges, inflate edges
+             ELSEIF ( nlev == 48 ) THEN
+
+                ! Sample every two edges (e.g. edges 38-39 on the fine grid are copies of edge 38 on the coarse grid)
+                coarseIDX = 37
+                DO I = 1,8
+                   fineIDX = 37 + I
+                   IF ( MOD(I,2) /= 0 ) THEN
+                     coarseIDX = coarseIDX + 1
+                   ENDIF
+                   Lct%Dct%Dta%V3(T)%Val(:,:,fineIDX) = REGR_4D(:,:,coarseIDX,T)
+                ENDDO ! I
+
+                ! Sample every four edges (e.g. edges 46-49 on the fine grid are copies of edge 42 on the coarse grid)
+                coarseIDX = 40
+                DO I = 1,28
+                   fineIDX = 44 + i
+                   IF ( MOD(I-1,4) == 0 ) THEN
+                      coarseIDX = coarseIDX + 1
+                   ENDIF
+                   Lct%Dct%Dta%V3(T)%Val(:,:,fineIDX) = REGR_4D(:,:,coarseIDX,T)
+                ENDDO ! I
+                
+             ELSEIF ( nlev == 3 ) THEN
+               DO L = 4,72
+                  Lct%Dct%Dta%V3(T)%Val(:,:,L) = 0.0_hp
+               ENDDO !L
+
+             ELSEIF ( nlev == 11 ) THEN
+               DO L = 12,72
+                  Lct%Dct%Dta%V3(T)%Val(:,:,L) = 0.0_hp
+               ENDDO !L
+
+             ELSEIF ( nlev == 36 ) THEN
+               DO L = 37,72
+                  Lct%Dct%Dta%V3(T)%Val(:,:,L) = 0.0_hp
+               ENDDO !L
+
+             ENDIF ! nlev == (47,48,3,11,36)
+          ENDDO ! T
+
+          ! Verbose
+          IF ( HcoState%Config%doVerbose ) THEN
+             WRITE(MSG,*) 'Mapped ', nlev, ' levels onto native GEOS-5 levels.'
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+             IF ( nlev == 3 .OR. nlev == 11 .OR. nlev == 36 ) THEN
+               WRITE(MSG,*) 'The input variable has ', nlev, 'L, which were written to be L 1-', nlev, ' on the output 72 L grid (remaining values set to 0).'
+             ELSE
+               WRITE(MSG,*) 'Inflating from 47/48 to 72/73 levels is not recommended and is likely not mass-conserving.'
+             ENDIF
+             CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          ENDIF
+
+          ! Done!
+          DONE = .TRUE.
+
+       ENDIF ! nz == (47,74,72)
+
+    ENDIF ! Vertical regridding required
+
+    !===================================================================
+    ! Error check / verbose mode
+    !===================================================================
+    IF ( DONE ) THEN
+      IF ( HcoState%Config%doVerbose ) THEN
+          WRITE(MSG,*) 'Did vertical regridding for ',TRIM(Lct%Dct%cName),':'
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          WRITE(MSG,*) 'Number of original levels: ', nlev
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+          WRITE(MSG,*) 'Number of output levels: ', SIZE(Lct%Dct%Dta%V3(1)%Val,3)
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+    ELSE
+       WRITE(MSG,*) 'Vertical regridding failed: ',TRIM(Lct%Dct%cName)
+       CALL HCO_ERROR( MSG, RC )
+       RETURN
+    ENDIF
+
+    ! Return w/ success
+    CALL HCO_LEAVE ( HcoState%Config%Err, RC )
+
+  END SUBROUTINE ModelLev_Interpolate
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: COLLAPSE
+!
+! !DESCRIPTION: Helper routine to collapse input levels onto the output grid.
+! The input data is weighted by the grid box thicknesses defined on top of
+! this module. The input parameter T determines the time slice to be considered,
+! and MET denotes the met field type of the input data (22 = GISS, 5= GEOS-5).
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE COLLAPSE( Lct,    REGR_4D, OutLev,                              &
+                       InLev1, NLEV,    T,                                   &
+                       MET,    do_sum,  RC                                  )
+!
+! !INPUT PARAMETERS:
+!
+    REAL(sp),         POINTER        :: REGR_4D(:,:,:,:) ! 4D input data
+    INTEGER,          INTENT(IN)     :: OutLev           ! Output level
+    INTEGER,          INTENT(IN)     :: InLev1           ! 1st input level
+    INTEGER,          INTENT(IN)     :: NLEV             ! # of levels
+    INTEGER,          INTENT(IN)     :: T                ! Time index
+    LOGICAL,          INTENT(IN)     :: do_sum           ! Sum instead of avg?
+    INTEGER,          INTENT(IN)     :: MET              ! 22=GISS E2.2,
+                                                         !  otherwise GMAO
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    TYPE(ListCont),   POINTER        :: Lct              ! HEMCO list container
+    INTEGER,          INTENT(INOUT)  :: RC               ! Success or failure?
+!
+! !REVISION HISTORY:
+!  30 Dec 2014 - C. Keller   - Initial version
+!  See https://github.com/geoschem/hemco for complete history
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+    INTEGER               :: I, NZ, ILEV, TOPLEV
+    REAL(hp)              :: THICK
+    REAL(hp), POINTER     :: EDG(:)
+    REAL(hp), ALLOCATABLE :: WGT(:)
+    CHARACTER(LEN=255)      :: MSG
+    CHARACTER(LEN=255)      :: LOC = 'ModelLev_Interpolate (hco_interp_mod.F90)'
+
+    !=================================================================
+    ! COLLAPSE begins here
+    !=================================================================
+
+    ! Init
+    EDG => NULL()
+
+    ! Reset
+    Lct%Dct%Dta%V3(T)%Val(:,:,OutLev) = 0.0_hp
+
+    ! Don't do anything if there are not enough levels in REGR_4D
+    NZ = SIZE(REGR_4D,3)
+    IF ( NZ < InLev1 ) RETURN
+
+    ! Get maximum level to be used for pressure thickness calculations.
+    TOPLEV = InLev1 + NLEV
+
+    ! Get pointer to grid edges on the native input grid
+    IF ( Met == 22 ) THEN
+       EDG => E102_EDGE_NATIVE(InLev1:TOPLEV)
+    ELSEIF ( Met == 5 ) THEN 
+       EDG => G5_EDGE_NATIVE(InLev1:TOPLEV)
+    ELSE
+       WRITE(MSG,*) 'The Met value given was not valid: ', Met
+       CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    ! Thickness of output level
+    THICK = EDG(1) - EDG(NLEV+1)
+
+    ! Get level weights.  If DO_SUM = T, then we will sum
+    ! the variable in the vertical instead of averaging.
+    ALLOCATE(WGT(NLEV))
+    IF ( do_sum ) THEN
+       WGT = 1.0
+    ELSE
+       WGT = 0.0
+       DO I = 1, NLEV
+          WGT(I) = ( EDG(I) - EDG(I+1) ) / THICK
+       ENDDO
+    ENDIF
+
+    ! Pass levels to output data, one after each other
+    Lct%Dct%Dta%V3(T)%Val(:,:,OutLev) = REGR_4D(:,:,InLev1,T) * WGT(1)
+    DO I = 1, NLEV-1
+       ILEV = InLev1 + I
+       IF ( NZ < ILEV ) EXIT
+       Lct%Dct%Dta%V3(T)%Val(:,:,OutLev) = Lct%Dct%Dta%V3(T)%Val(:,:,OutLev) &
+                                         + ( REGR_4D(:,:,ILEV,T) * WGT(I+1) )
+    ENDDO
+
+    ! Cleanup
+    DEALLOCATE(WGT)
+    EDG => NULL()
+
+  END SUBROUTINE COLLAPSE
+!EOC
+END MODULE HCO_Interp_Mod

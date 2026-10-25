@@ -1,0 +1,4 @@
+build/
+build_*/
+hemco_standalone
+*.nc
